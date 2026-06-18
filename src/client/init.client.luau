@@ -16,6 +16,13 @@ local openShopEvent = ReplicatedStorage:WaitForChild("OpenShop")
 local TABS = { "Zen", "Soul Jar", "Ascend" }
 local DEFAULT_TAB = "Zen"
 
+-- Playful UI font used everywhere (HUD + shop).
+-- NOTE: "Baloo 2" is NOT a valid Enum.Font and isn't a built-in Roblox FontFace
+-- family, so it would error / silently fall back. FredokaOne is the closest
+-- guaranteed built-in rounded, playful font. Swap this one constant later if you
+-- upload Baloo 2 as a custom FontFace.
+local FONT = Enum.Font.FredokaOne
+
 --------------------------------------------------------------------------------
 -- Small styling helpers
 --------------------------------------------------------------------------------
@@ -99,7 +106,7 @@ title.Size = UDim2.new(1, -80, 1, 0)
 title.Position = UDim2.fromOffset(20, 0)
 title.BackgroundTransparency = 1
 title.Text = "SPIRIT SHOP"
-title.Font = Enum.Font.GothamBold
+title.Font = FONT
 title.TextSize = 30
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -115,7 +122,7 @@ closeButton.Position = UDim2.new(1, -16, 0.5, 0)
 closeButton.Size = UDim2.fromOffset(40, 40)
 closeButton.BackgroundColor3 = Color3.fromRGB(235, 70, 70) -- red
 closeButton.Text = "X"
-closeButton.Font = Enum.Font.GothamBold
+closeButton.Font = FONT
 closeButton.TextSize = 24
 closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 closeButton.ZIndex = 3
@@ -171,7 +178,7 @@ for index, name in ipairs(TABS) do
 	button.LayoutOrder = index
 	button.Size = UDim2.fromOffset(160, 44)
 	button.Text = name
-	button.Font = Enum.Font.GothamBold
+	button.Font = FONT
 	button.TextSize = 20
 	button.AutoButtonColor = true
 	button.ZIndex = 2
@@ -190,12 +197,12 @@ for index, name in ipairs(TABS) do
 	panel.Parent = content
 	panels[name] = panel
 
-	if name ~= "Zen" then
+	if name ~= "Zen" and name ~= "Ascend" then
 		local placeholder = Instance.new("TextLabel")
 		placeholder.Size = UDim2.fromScale(1, 1)
 		placeholder.BackgroundTransparency = 1
 		placeholder.Text = name .. " upgrades coming soon"
-		placeholder.Font = Enum.Font.GothamBold
+		placeholder.Font = FONT
 		placeholder.TextSize = 26
 		placeholder.TextColor3 = Color3.fromRGB(255, 255, 255)
 		placeholder.TextWrapped = true
@@ -289,7 +296,7 @@ multLabel.Position = UDim2.new(0.5, 0, 0, 16)
 multLabel.Size = UDim2.new(1, -32, 0, 70)
 multLabel.BackgroundTransparency = 1
 multLabel.Text = "x1"
-multLabel.Font = Enum.Font.GothamBold
+multLabel.Font = FONT
 multLabel.TextSize = 56
 multLabel.TextColor3 = Color3.fromRGB(255, 200, 40) -- gold accent
 multLabel.TextStrokeTransparency = 0.7
@@ -304,7 +311,7 @@ levelLabel.Position = UDim2.new(0.5, 0, 0, 88)
 levelLabel.Size = UDim2.new(1, -32, 0, 28)
 levelLabel.BackgroundTransparency = 1
 levelLabel.Text = "Zen Level 0"
-levelLabel.Font = Enum.Font.GothamBold
+levelLabel.Font = FONT
 levelLabel.TextSize = 22
 levelLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
 levelLabel.ZIndex = 1
@@ -318,7 +325,7 @@ descLabel.Position = UDim2.new(0.5, 0, 0, 118)
 descLabel.Size = UDim2.new(1, -40, 0, 24)
 descLabel.BackgroundTransparency = 1
 descLabel.Text = "Each level doubles your click power."
-descLabel.Font = Enum.Font.Gotham
+descLabel.Font = FONT
 descLabel.TextSize = 16
 descLabel.TextColor3 = Color3.fromRGB(210, 200, 230)
 descLabel.TextWrapped = true
@@ -336,7 +343,7 @@ buyButton.Position = UDim2.new(0.5, 0, 1, -16)
 buyButton.Size = UDim2.new(1, -40, 0, 56)
 buyButton.BackgroundColor3 = BUY_COLOR
 buyButton.Text = "BUY"
-buyButton.Font = Enum.Font.GothamBold
+buyButton.Font = FONT
 buyButton.TextSize = 24
 buyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 buyButton.TextStrokeTransparency = 0.6
@@ -381,3 +388,272 @@ end)
 -- Keep the panel current: refresh once at startup and every time the shop opens.
 openShopEvent.OnClientEvent:Connect(refreshZen)
 refreshZen()
+
+--------------------------------------------------------------------------------
+-- Rank titles & colors (edit these freely to rename / recolor ranks)
+--------------------------------------------------------------------------------
+-- Ordered ladder: AscendCount 0 = first title; anything past the last title
+-- stays at the final one.
+local RANK_TITLES = {
+	"Seeker", "Disciple", "Adept", "Mystic", "Sage",
+	"Ascendant", "Immortal", "Celestial", "Transcendent", "Eternal",
+}
+
+-- Colors escalate in grandeur: gray/white/blue -> purple -> gold/glowing.
+local RANK_COLORS = {
+	Seeker = Color3.fromRGB(170, 175, 185), -- gray
+	Disciple = Color3.fromRGB(240, 240, 245), -- white
+	Adept = Color3.fromRGB(90, 170, 255), -- blue
+	Mystic = Color3.fromRGB(120, 110, 245), -- indigo
+	Sage = Color3.fromRGB(175, 95, 235), -- purple
+	Ascendant = Color3.fromRGB(225, 90, 205), -- magenta
+	Immortal = Color3.fromRGB(255, 115, 90), -- ember orange
+	Celestial = Color3.fromRGB(255, 185, 65), -- amber
+	Transcendent = Color3.fromRGB(255, 215, 60), -- gold
+	Eternal = Color3.fromRGB(255, 245, 170), -- glowing pale gold
+}
+
+local function getRankTitle(count)
+	return RANK_TITLES[math.min(count + 1, #RANK_TITLES)]
+end
+
+local function getRankColor(count)
+	return RANK_COLORS[getRankTitle(count)]
+end
+
+--------------------------------------------------------------------------------
+-- Number formatting helpers
+--------------------------------------------------------------------------------
+
+-- "12345" -> "12,345"
+local function commafy(n)
+	local s = tostring(math.floor(n))
+	while true do
+		local replaced, count = s:gsub("^(-?%d+)(%d%d%d)", "%1,%2")
+		s = replaced
+		if count == 0 then
+			break
+		end
+	end
+	return s
+end
+
+-- 1.5 -> "x1.5", 1 -> "x1", 2.25 -> "x2.25"
+local function fmtMult(m)
+	local s = string.format("%.2f", m)
+	s = s:gsub("0+$", ""):gsub("%.$", "")
+	return "x" .. s
+end
+
+--------------------------------------------------------------------------------
+-- Live Spirit Power value (read-only on the client)
+--------------------------------------------------------------------------------
+-- The server owns this IntValue; we just watch it so the HUD and the Ascend
+-- button update live. The client never writes to it.
+
+local statsFolder = player:WaitForChild("leaderstats")
+local spiritPowerValue = statsFolder:WaitForChild("Spirit Power")
+
+local getAscendStateFunc = ReplicatedStorage:WaitForChild("GetAscendState")
+local ascendFunc = ReplicatedStorage:WaitForChild("Ascend")
+
+--------------------------------------------------------------------------------
+-- On-screen HUD (always visible, separate from the shop popup)
+--------------------------------------------------------------------------------
+
+local hud = Instance.new("ScreenGui")
+hud.Name = "HUD"
+hud.ResetOnSpawn = false
+hud.IgnoreGuiInset = true
+hud.Parent = playerGui
+
+-- Big SILVER Spirit Power counter, top-center.
+local spiritCounter = Instance.new("TextLabel")
+spiritCounter.Name = "SpiritCounter"
+spiritCounter.AnchorPoint = Vector2.new(0.5, 0)
+spiritCounter.Position = UDim2.new(0.5, 0, 0, 14)
+spiritCounter.Size = UDim2.fromOffset(460, 52)
+spiritCounter.BackgroundTransparency = 1
+spiritCounter.Font = FONT
+spiritCounter.TextScaled = true
+spiritCounter.TextColor3 = Color3.fromRGB(205, 210, 220) -- silver
+spiritCounter.TextStrokeTransparency = 0.35
+spiritCounter.TextStrokeColor3 = Color3.fromRGB(40, 40, 55)
+spiritCounter.Text = "0 Spirit Power"
+spiritCounter.Parent = hud
+
+local spiritCap = Instance.new("UITextSizeConstraint")
+spiritCap.MaxTextSize = 44
+spiritCap.Parent = spiritCounter
+
+-- Big COLOR-CODED rank title, just below the counter.
+local rankDisplay = Instance.new("TextLabel")
+rankDisplay.Name = "RankDisplay"
+rankDisplay.AnchorPoint = Vector2.new(0.5, 0)
+rankDisplay.Position = UDim2.new(0.5, 0, 0, 66)
+rankDisplay.Size = UDim2.fromOffset(360, 40)
+rankDisplay.BackgroundTransparency = 1
+rankDisplay.Font = FONT
+rankDisplay.TextScaled = true
+rankDisplay.TextStrokeTransparency = 0.45
+rankDisplay.TextStrokeColor3 = Color3.fromRGB(20, 20, 28)
+rankDisplay.Text = "Seeker"
+rankDisplay.Parent = hud
+
+local rankCap = Instance.new("UITextSizeConstraint")
+rankCap.MaxTextSize = 34
+rankCap.Parent = rankDisplay
+
+local function updateHudSpirit()
+	spiritCounter.Text = commafy(spiritPowerValue.Value) .. " Spirit Power"
+end
+
+local function updateHudRank(count)
+	rankDisplay.Text = getRankTitle(count)
+	rankDisplay.TextColor3 = getRankColor(count)
+end
+
+--------------------------------------------------------------------------------
+-- Ascend tab (prestige) panel
+--------------------------------------------------------------------------------
+
+local ascendPanel = panels["Ascend"]
+local ASCEND_READY_COLOR = Color3.fromRGB(255, 200, 40) -- gold when ready
+local ASCEND_LOCKED_COLOR = Color3.fromRGB(110, 100, 140) -- muted when locked
+
+-- Rank title (color-coded), big at the top of the panel.
+local ascRankLabel = Instance.new("TextLabel")
+ascRankLabel.AnchorPoint = Vector2.new(0.5, 0)
+ascRankLabel.Position = UDim2.new(0.5, 0, 0, 12)
+ascRankLabel.Size = UDim2.new(1, -32, 0, 50)
+ascRankLabel.BackgroundTransparency = 1
+ascRankLabel.Font = FONT
+ascRankLabel.TextSize = 42
+ascRankLabel.TextStrokeTransparency = 0.6
+ascRankLabel.Text = "Seeker"
+ascRankLabel.ZIndex = 1
+ascRankLabel.Parent = ascendPanel
+
+-- Ascension count.
+local ascCountLabel = Instance.new("TextLabel")
+ascCountLabel.AnchorPoint = Vector2.new(0.5, 0)
+ascCountLabel.Position = UDim2.new(0.5, 0, 0, 66)
+ascCountLabel.Size = UDim2.new(1, -32, 0, 26)
+ascCountLabel.BackgroundTransparency = 1
+ascCountLabel.Font = FONT
+ascCountLabel.TextSize = 20
+ascCountLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+ascCountLabel.Text = "Ascensions: 0"
+ascCountLabel.ZIndex = 1
+ascCountLabel.Parent = ascendPanel
+
+-- Permanent multiplier reward.
+local ascMultLabel = Instance.new("TextLabel")
+ascMultLabel.AnchorPoint = Vector2.new(0.5, 0)
+ascMultLabel.Position = UDim2.new(0.5, 0, 0, 92)
+ascMultLabel.Size = UDim2.new(1, -32, 0, 26)
+ascMultLabel.BackgroundTransparency = 1
+ascMultLabel.Font = FONT
+ascMultLabel.TextSize = 20
+ascMultLabel.TextColor3 = Color3.fromRGB(255, 200, 40)
+ascMultLabel.Text = "Permanent bonus: x1"
+ascMultLabel.ZIndex = 1
+ascMultLabel.Parent = ascendPanel
+
+-- Requirement for the next Ascend.
+local ascReqLabel = Instance.new("TextLabel")
+ascReqLabel.AnchorPoint = Vector2.new(0.5, 0)
+ascReqLabel.Position = UDim2.new(0.5, 0, 0, 122)
+ascReqLabel.Size = UDim2.new(1, -40, 0, 24)
+ascReqLabel.BackgroundTransparency = 1
+ascReqLabel.Font = FONT
+ascReqLabel.TextSize = 16
+ascReqLabel.TextColor3 = Color3.fromRGB(210, 200, 230)
+ascReqLabel.TextWrapped = true
+ascReqLabel.Text = "Next Ascend needs 10,000 Spirit Power"
+ascReqLabel.ZIndex = 1
+ascReqLabel.Parent = ascendPanel
+
+-- ASCEND button.
+local ascendButton = Instance.new("TextButton")
+ascendButton.AnchorPoint = Vector2.new(0.5, 1)
+ascendButton.Position = UDim2.new(0.5, 0, 1, -16)
+ascendButton.Size = UDim2.new(1, -40, 0, 56)
+ascendButton.Font = FONT
+ascendButton.TextSize = 24
+ascendButton.TextStrokeTransparency = 0.6
+ascendButton.AutoButtonColor = false
+ascendButton.Text = "ASCEND"
+ascendButton.ZIndex = 1
+ascendButton.Parent = ascendPanel
+round(ascendButton, 14)
+stroke(ascendButton, Color3.fromRGB(150, 120, 30), 2)
+
+-- Latest authoritative Ascend state from the server.
+local ascendData = { count = 0, requirement = 0, multiplier = 1 }
+
+local function renderAscend()
+	local count = ascendData.count
+	ascRankLabel.Text = getRankTitle(count)
+	ascRankLabel.TextColor3 = getRankColor(count)
+	ascCountLabel.Text = "Ascensions: " .. count
+	ascMultLabel.Text = "Permanent bonus: " .. fmtMult(ascendData.multiplier)
+	ascReqLabel.Text = "Next Ascend needs " .. commafy(ascendData.requirement) .. " Spirit Power"
+
+	-- Button is enabled only when the player meets the requirement (checked live
+	-- against the Spirit Power value); otherwise it shows locked + the cost.
+	local ready = spiritPowerValue.Value >= ascendData.requirement
+	if ready then
+		ascendButton.Text = "ASCEND"
+		ascendButton.BackgroundColor3 = ASCEND_READY_COLOR
+		ascendButton.TextColor3 = Color3.fromRGB(60, 40, 0)
+		ascendButton.AutoButtonColor = true
+		ascendButton.Active = true
+	else
+		ascendButton.Text = "LOCKED  •  need " .. commafy(ascendData.requirement)
+		ascendButton.BackgroundColor3 = ASCEND_LOCKED_COLOR
+		ascendButton.TextColor3 = Color3.fromRGB(225, 220, 235)
+		ascendButton.AutoButtonColor = false
+		ascendButton.Active = false
+	end
+end
+
+-- Ask the server for the latest Ascend state, then redraw the panel + HUD rank.
+local function refreshAscend()
+	ascendData = getAscendStateFunc:InvokeServer()
+	renderAscend()
+	updateHudRank(ascendData.count)
+end
+
+-- Ascending: the server validates and returns the new state (unchanged if the
+-- requirement wasn't met). After a successful Ascend, Zen was reset and its cap
+-- raised, so we refresh that panel too.
+ascendButton.Activated:Connect(function()
+	if not ascendButton.Active then
+		return
+	end
+	ascendData = ascendFunc:InvokeServer()
+	renderAscend()
+	updateHudRank(ascendData.count)
+	refreshZen()
+	-- The server reset Spirit Power to 0, which fires the .Changed handler below
+	-- and updates the HUD counter automatically.
+end)
+
+--------------------------------------------------------------------------------
+-- Live wiring
+--------------------------------------------------------------------------------
+
+-- Spirit Power changing updates the HUD counter and re-evaluates whether the
+-- ASCEND button should now be unlocked.
+spiritPowerValue.Changed:Connect(function()
+	updateHudSpirit()
+	renderAscend()
+end)
+
+-- Refresh the Ascend panel whenever the shop opens, too.
+openShopEvent.OnClientEvent:Connect(refreshAscend)
+
+-- Initial draw.
+updateHudSpirit()
+refreshAscend()

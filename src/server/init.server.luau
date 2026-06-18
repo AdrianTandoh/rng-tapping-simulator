@@ -36,15 +36,27 @@ local buyZenFunc = Instance.new("RemoteFunction")
 buyZenFunc.Name = "BuyZen"
 buyZenFunc.Parent = ReplicatedStorage
 
+-- Client invokes this to read its current Ascend state (count/requirement/mult).
+local getAscendStateFunc = Instance.new("RemoteFunction")
+getAscendStateFunc.Name = "GetAscendState"
+getAscendStateFunc.Parent = ReplicatedStorage
+
+-- Client invokes this to request an Ascend. The SERVER validates and returns
+-- the resulting (authoritative) Ascend state either way.
+local buyAscendFunc = Instance.new("RemoteFunction")
+buyAscendFunc.Name = "Ascend"
+buyAscendFunc.Parent = ReplicatedStorage
+
 --------------------------------------------------------------------------------
 -- 2. Give every player a leaderstats folder
 --------------------------------------------------------------------------------
 -- Roblox automatically shows any IntValue/NumberValue inside a "leaderstats"
 -- folder on the in-game leaderboard. We create one Spirit Power value per player.
 
--- Server-authoritative Zen level per player ([player] = number, starts at 0).
--- Declared here (before setupLeaderstats) so the leaderstats setup can seed it.
-local zenLevel = {}
+-- Server-authoritative per-player progression, declared here (before
+-- setupLeaderstats) so the leaderstats setup can seed them.
+local zenLevel = {} -- [player] = Zen level (number, starts at 0)
+local ascendCount = {} -- [player] = number of times Ascended (starts at 0)
 
 local function setupLeaderstats(player)
 	local leaderstats = Instance.new("Folder")
@@ -57,8 +69,9 @@ local function setupLeaderstats(player)
 
 	leaderstats.Parent = player
 
-	-- Start every player at Zen level 0 (x1 click multiplier).
+	-- Start every player at Zen level 0 (x1 click multiplier) and Ascend count 0.
 	zenLevel[player] = 0
+	ascendCount[player] = 0
 end
 
 -- Handle players who join after this script runs...
@@ -69,17 +82,28 @@ for _, player in ipairs(Players:GetPlayers()) do
 end
 
 --------------------------------------------------------------------------------
--- 3. Single chokepoint for granting Spirit Power
+-- 3. Ascend rewards + the single chokepoint for granting Spirit Power
 --------------------------------------------------------------------------------
--- ALL Spirit Power changes go through this one function. Right now only the
--- click handler calls it (amount = 1), but a future auto-clicker can call the
--- exact same function, so there's only ever one place that touches the stat.
+-- Ascend (prestige) tuning values — all grouped here so they're easy to tweak.
+local ASCEND_BASE_REQUIREMENT = 10000 -- Spirit Power needed for the 1st Ascend
+local ASCEND_REQUIREMENT_SCALE = 5 -- each Ascend multiplies the requirement by this
+local ASCEND_CAP_INCREASE = 2 -- each Ascend raises the Zen level cap by this much
+local ASCEND_MULTIPLIER_PER = 1.5 -- permanent Spirit Power multiplier gained per Ascend
 
+-- Permanent global multiplier from prestige: 1.5 ^ AscendCount.
+local function getAscendMultiplier(player)
+	return ASCEND_MULTIPLIER_PER ^ (ascendCount[player] or 0)
+end
+
+-- ALL Spirit Power changes go through this one function, so every gain (clicks
+-- now, auto-clicker later) automatically receives the Ascend multiplier on top
+-- of whatever amount the caller passes in.
 local function grantSpiritPower(player, amount)
 	local leaderstats = player:FindFirstChild("leaderstats")
 	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
 	if spiritPower then
-		spiritPower.Value += amount
+		-- Apply the permanent Ascend multiplier, then floor to a whole number.
+		spiritPower.Value += math.floor(amount * getAscendMultiplier(player))
 	end
 end
 
@@ -89,14 +113,18 @@ end
 -- Zen is a click multiplier. multiplier = 2 ^ ZenLevel, so each level doubles
 -- click value (level 0 = x1, level 1 = x2, ... level 8 = x256).
 --
--- The cap is a VARIABLE, not a hardcoded literal, so a future "Ascend" system
--- can raise it at runtime. The buy logic below only ever compares against this.
-local zenCap = 8 -- max Zen level for now (x256); Ascend will raise this later
-
+-- The cap is computed per player (getZenCap) from a base value plus the Ascend
+-- bonus, so the buy logic never hardcodes the limit.
+local ZEN_BASE_CAP = 8 -- base max Zen level (x256); each Ascend raises it by ASCEND_CAP_INCREASE
 local ZEN_BASE_PRICE = 50 -- Spirit Power cost of the first level (0 -> 1)
 local ZEN_PRICE_MULTIPLIER = 2.5 -- each level costs 2.5x the previous one
 
 -- (zenLevel table is declared earlier, near the leaderstats setup.)
+
+-- A player's current Zen cap rises with how many times they've Ascended.
+local function getZenCap(player)
+	return ZEN_BASE_CAP + (ascendCount[player] or 0) * ASCEND_CAP_INCREASE
+end
 
 -- Click value multiplier for a given Zen level.
 local function getZenMultiplier(level)
@@ -113,13 +141,14 @@ end
 -- When maxed, `cost` is nil (there's nothing left to buy).
 local function getZenState(player)
 	local level = zenLevel[player] or 0
-	local maxed = level >= zenCap
+	local cap = getZenCap(player)
+	local maxed = level >= cap
 	return {
 		level = level,
 		multiplier = getZenMultiplier(level),
 		cost = (not maxed) and getZenCost(level) or nil,
 		maxed = maxed,
-		cap = zenCap,
+		cap = cap,
 	}
 end
 
@@ -133,7 +162,7 @@ buyZenFunc.OnServerInvoke = function(player)
 	local level = zenLevel[player] or 0
 
 	-- Reject if already at the cap.
-	if level >= zenCap then
+	if level >= getZenCap(player) then
 		return getZenState(player) -- unchanged
 	end
 
@@ -149,6 +178,54 @@ buyZenFunc.OnServerInvoke = function(player)
 	spiritPower.Value -= cost
 	zenLevel[player] = level + 1
 	return getZenState(player)
+end
+
+--------------------------------------------------------------------------------
+-- 3c. Ascend (prestige)
+--------------------------------------------------------------------------------
+-- Spirit Power required to Ascend at a given count.
+-- count 0 -> 10,000, count 1 -> 50,000, count 2 -> 250,000, ...
+local function getAscendRequirement(count)
+	return ASCEND_BASE_REQUIREMENT * (ASCEND_REQUIREMENT_SCALE ^ count)
+end
+
+-- Snapshot of a player's Ascend state for the client to render.
+local function getAscendState(player)
+	local count = ascendCount[player] or 0
+	return {
+		count = count,
+		requirement = getAscendRequirement(count),
+		multiplier = getAscendMultiplier(player),
+	}
+end
+
+-- Client asks for its current Ascend state (on shop open / startup).
+getAscendStateFunc.OnServerInvoke = function(player)
+	return getAscendState(player)
+end
+
+-- Ascend handler — fully validated on the server.
+buyAscendFunc.OnServerInvoke = function(player)
+	local count = ascendCount[player] or 0
+	local requirement = getAscendRequirement(count)
+
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
+
+	-- Reject if the player doesn't meet the Spirit Power requirement.
+	if not spiritPower or spiritPower.Value < requirement then
+		return getAscendState(player) -- unchanged
+	end
+
+	-- Perform the prestige:
+	--  * reset Spirit Power to 0
+	--  * reset Zen level to 0
+	--  * increment Ascend count (this also raises the Zen cap via getZenCap and
+	--    strengthens all future gains via getAscendMultiplier)
+	spiritPower.Value = 0
+	zenLevel[player] = 0
+	ascendCount[player] = count + 1
+	return getAscendState(player)
 end
 
 --------------------------------------------------------------------------------
@@ -248,4 +325,5 @@ Players.PlayerRemoving:Connect(function(player)
 	lastClickTime[player] = nil
 	touchDebounce[player] = nil
 	zenLevel[player] = nil
+	ascendCount[player] = nil
 end)
