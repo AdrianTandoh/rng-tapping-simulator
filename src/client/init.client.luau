@@ -179,7 +179,8 @@ for index, name in ipairs(TABS) do
 	round(button, 12)
 	tabButtons[name] = button
 
-	-- Matching panel (placeholder content for now).
+	-- Matching panel. The Zen panel is built for real further below; the other
+	-- tabs keep their placeholder text for now.
 	local panel = Instance.new("Frame")
 	panel.Name = name .. "Panel"
 	panel.Size = UDim2.fromScale(1, 1)
@@ -189,16 +190,18 @@ for index, name in ipairs(TABS) do
 	panel.Parent = content
 	panels[name] = panel
 
-	local placeholder = Instance.new("TextLabel")
-	placeholder.Size = UDim2.fromScale(1, 1)
-	placeholder.BackgroundTransparency = 1
-	placeholder.Text = name .. " upgrades coming soon"
-	placeholder.Font = Enum.Font.GothamBold
-	placeholder.TextSize = 26
-	placeholder.TextColor3 = Color3.fromRGB(255, 255, 255)
-	placeholder.TextWrapped = true
-	placeholder.ZIndex = 1
-	placeholder.Parent = panel
+	if name ~= "Zen" then
+		local placeholder = Instance.new("TextLabel")
+		placeholder.Size = UDim2.fromScale(1, 1)
+		placeholder.BackgroundTransparency = 1
+		placeholder.Text = name .. " upgrades coming soon"
+		placeholder.Font = Enum.Font.GothamBold
+		placeholder.TextSize = 26
+		placeholder.TextColor3 = Color3.fromRGB(255, 255, 255)
+		placeholder.TextWrapped = true
+		placeholder.ZIndex = 1
+		placeholder.Parent = panel
+	end
 end
 
 --------------------------------------------------------------------------------
@@ -264,3 +267,117 @@ UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
 		clickEarnEvent:FireServer()
 	end
 end)
+
+--------------------------------------------------------------------------------
+-- Zen tab: click multiplier upgrade
+--------------------------------------------------------------------------------
+-- Builds the real Zen panel and wires it to the server. The server is the only
+-- authority on Zen level / Spirit Power; this UI just displays what the server
+-- returns and asks it to buy. The panel re-renders whenever the shop opens and
+-- after every purchase attempt.
+
+local getZenStateFunc = ReplicatedStorage:WaitForChild("GetZenState")
+local buyZenFunc = ReplicatedStorage:WaitForChild("BuyZen")
+
+local zenPanel = panels["Zen"]
+
+-- Big current-multiplier readout (e.g. "x4").
+local multLabel = Instance.new("TextLabel")
+multLabel.Name = "Multiplier"
+multLabel.AnchorPoint = Vector2.new(0.5, 0)
+multLabel.Position = UDim2.new(0.5, 0, 0, 16)
+multLabel.Size = UDim2.new(1, -32, 0, 70)
+multLabel.BackgroundTransparency = 1
+multLabel.Text = "x1"
+multLabel.Font = Enum.Font.GothamBold
+multLabel.TextSize = 56
+multLabel.TextColor3 = Color3.fromRGB(255, 200, 40) -- gold accent
+multLabel.TextStrokeTransparency = 0.7
+multLabel.ZIndex = 1
+multLabel.Parent = zenPanel
+
+-- Current Zen level.
+local levelLabel = Instance.new("TextLabel")
+levelLabel.Name = "Level"
+levelLabel.AnchorPoint = Vector2.new(0.5, 0)
+levelLabel.Position = UDim2.new(0.5, 0, 0, 88)
+levelLabel.Size = UDim2.new(1, -32, 0, 28)
+levelLabel.BackgroundTransparency = 1
+levelLabel.Text = "Zen Level 0"
+levelLabel.Font = Enum.Font.GothamBold
+levelLabel.TextSize = 22
+levelLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+levelLabel.ZIndex = 1
+levelLabel.Parent = zenPanel
+
+-- Short description of what Zen does.
+local descLabel = Instance.new("TextLabel")
+descLabel.Name = "Desc"
+descLabel.AnchorPoint = Vector2.new(0.5, 0)
+descLabel.Position = UDim2.new(0.5, 0, 0, 118)
+descLabel.Size = UDim2.new(1, -40, 0, 24)
+descLabel.BackgroundTransparency = 1
+descLabel.Text = "Each level doubles your click power."
+descLabel.Font = Enum.Font.Gotham
+descLabel.TextSize = 16
+descLabel.TextColor3 = Color3.fromRGB(210, 200, 230)
+descLabel.TextWrapped = true
+descLabel.ZIndex = 1
+descLabel.Parent = zenPanel
+
+-- BUY button (also shows the cost / MAX state).
+local BUY_COLOR = Color3.fromRGB(70, 200, 90) -- friendly green
+local MAX_COLOR = Color3.fromRGB(110, 100, 140) -- muted when maxed
+
+local buyButton = Instance.new("TextButton")
+buyButton.Name = "Buy"
+buyButton.AnchorPoint = Vector2.new(0.5, 1)
+buyButton.Position = UDim2.new(0.5, 0, 1, -16)
+buyButton.Size = UDim2.new(1, -40, 0, 56)
+buyButton.BackgroundColor3 = BUY_COLOR
+buyButton.Text = "BUY"
+buyButton.Font = Enum.Font.GothamBold
+buyButton.TextSize = 24
+buyButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+buyButton.TextStrokeTransparency = 0.6
+buyButton.AutoButtonColor = true
+buyButton.ZIndex = 1
+buyButton.Parent = zenPanel
+round(buyButton, 14)
+stroke(buyButton, Color3.fromRGB(40, 120, 55), 2)
+
+-- Render the panel from an authoritative state table sent by the server.
+local function renderZen(state)
+	multLabel.Text = string.format("x%d", state.multiplier)
+	levelLabel.Text = "Zen Level " .. state.level
+
+	if state.maxed then
+		buyButton.Text = "MAX"
+		buyButton.BackgroundColor3 = MAX_COLOR
+		buyButton.AutoButtonColor = false
+		buyButton.Active = false -- unbuyable at the cap
+	else
+		buyButton.Text = "BUY  •  " .. state.cost .. " Spirit Power"
+		buyButton.BackgroundColor3 = BUY_COLOR
+		buyButton.AutoButtonColor = true
+		buyButton.Active = true
+	end
+end
+
+-- Ask the server for the latest state and redraw.
+local function refreshZen()
+	renderZen(getZenStateFunc:InvokeServer())
+end
+
+-- Buying: the server validates and returns the resulting state (unchanged if the
+-- purchase was rejected for being maxed or too expensive), which we render.
+buyButton.Activated:Connect(function()
+	if not buyButton.Active then
+		return
+	end
+	renderZen(buyZenFunc:InvokeServer())
+end)
+
+-- Keep the panel current: refresh once at startup and every time the shop opens.
+openShopEvent.OnClientEvent:Connect(refreshZen)
+refreshZen()

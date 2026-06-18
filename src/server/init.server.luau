@@ -25,11 +25,26 @@ local openShopEvent = Instance.new("RemoteEvent")
 openShopEvent.Name = "OpenShop"
 openShopEvent.Parent = ReplicatedStorage
 
+-- Client invokes this to read its current Zen state (level/cost/multiplier).
+local getZenStateFunc = Instance.new("RemoteFunction")
+getZenStateFunc.Name = "GetZenState"
+getZenStateFunc.Parent = ReplicatedStorage
+
+-- Client invokes this to request a Zen purchase. The SERVER validates and
+-- returns the resulting (authoritative) Zen state either way.
+local buyZenFunc = Instance.new("RemoteFunction")
+buyZenFunc.Name = "BuyZen"
+buyZenFunc.Parent = ReplicatedStorage
+
 --------------------------------------------------------------------------------
 -- 2. Give every player a leaderstats folder
 --------------------------------------------------------------------------------
 -- Roblox automatically shows any IntValue/NumberValue inside a "leaderstats"
 -- folder on the in-game leaderboard. We create one Spirit Power value per player.
+
+-- Server-authoritative Zen level per player ([player] = number, starts at 0).
+-- Declared here (before setupLeaderstats) so the leaderstats setup can seed it.
+local zenLevel = {}
 
 local function setupLeaderstats(player)
 	local leaderstats = Instance.new("Folder")
@@ -41,6 +56,9 @@ local function setupLeaderstats(player)
 	spiritPower.Parent = leaderstats
 
 	leaderstats.Parent = player
+
+	-- Start every player at Zen level 0 (x1 click multiplier).
+	zenLevel[player] = 0
 end
 
 -- Handle players who join after this script runs...
@@ -66,6 +84,74 @@ local function grantSpiritPower(player, amount)
 end
 
 --------------------------------------------------------------------------------
+-- 3b. Zen upgrade (click multiplier)
+--------------------------------------------------------------------------------
+-- Zen is a click multiplier. multiplier = 2 ^ ZenLevel, so each level doubles
+-- click value (level 0 = x1, level 1 = x2, ... level 8 = x256).
+--
+-- The cap is a VARIABLE, not a hardcoded literal, so a future "Ascend" system
+-- can raise it at runtime. The buy logic below only ever compares against this.
+local zenCap = 8 -- max Zen level for now (x256); Ascend will raise this later
+
+local ZEN_BASE_PRICE = 50 -- Spirit Power cost of the first level (0 -> 1)
+local ZEN_PRICE_MULTIPLIER = 2.5 -- each level costs 2.5x the previous one
+
+-- (zenLevel table is declared earlier, near the leaderstats setup.)
+
+-- Click value multiplier for a given Zen level.
+local function getZenMultiplier(level)
+	return 2 ^ level
+end
+
+-- Cost (whole number) to buy the NEXT level when currently at `level`.
+-- At level 0 -> 50, level 1 -> 125, level 2 -> 313, level 3 -> 781, ...
+local function getZenCost(level)
+	return math.round(ZEN_BASE_PRICE * (ZEN_PRICE_MULTIPLIER ^ level))
+end
+
+-- Snapshot of a player's Zen state, sent to the client to render the panel.
+-- When maxed, `cost` is nil (there's nothing left to buy).
+local function getZenState(player)
+	local level = zenLevel[player] or 0
+	local maxed = level >= zenCap
+	return {
+		level = level,
+		multiplier = getZenMultiplier(level),
+		cost = (not maxed) and getZenCost(level) or nil,
+		maxed = maxed,
+		cap = zenCap,
+	}
+end
+
+-- The client asks for its current Zen state when it opens the shop.
+getZenStateFunc.OnServerInvoke = function(player)
+	return getZenState(player)
+end
+
+-- Purchase handler — fully validated on the server.
+buyZenFunc.OnServerInvoke = function(player)
+	local level = zenLevel[player] or 0
+
+	-- Reject if already at the cap.
+	if level >= zenCap then
+		return getZenState(player) -- unchanged
+	end
+
+	-- Reject if the player can't afford the next level.
+	local cost = getZenCost(level)
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
+	if not spiritPower or spiritPower.Value < cost then
+		return getZenState(player) -- unchanged
+	end
+
+	-- Valid purchase: deduct cost and increment level.
+	spiritPower.Value -= cost
+	zenLevel[player] = level + 1
+	return getZenState(player)
+end
+
+--------------------------------------------------------------------------------
 -- 4. Click-to-earn with a simple rate limit
 --------------------------------------------------------------------------------
 -- Basic anti-exploit protection: a client could be hacked to fire the RemoteEvent
@@ -86,7 +172,12 @@ clickEarnEvent.OnServerEvent:Connect(function(player)
 	end
 
 	lastClickTime[player] = now
-	grantSpiritPower(player, 1) -- one click = +1 Spirit Power
+
+	-- One click is worth baseAmount * the player's Zen multiplier. Everything
+	-- still flows through grantSpiritPower so a future auto-clicker reuses it.
+	local CLICK_BASE_AMOUNT = 1
+	local multiplier = getZenMultiplier(zenLevel[player] or 0)
+	grantSpiritPower(player, CLICK_BASE_AMOUNT * multiplier)
 end)
 
 --------------------------------------------------------------------------------
@@ -156,4 +247,5 @@ end)
 Players.PlayerRemoving:Connect(function(player)
 	lastClickTime[player] = nil
 	touchDebounce[player] = nil
+	zenLevel[player] = nil
 end)
