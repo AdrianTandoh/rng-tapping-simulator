@@ -197,7 +197,7 @@ for index, name in ipairs(TABS) do
 	panel.Parent = content
 	panels[name] = panel
 
-	if name ~= "Zen" and name ~= "Ascend" then
+	if name ~= "Zen" and name ~= "Ascend" and name ~= "Soul Jar" then
 		local placeholder = Instance.new("TextLabel")
 		placeholder.Size = UDim2.fromScale(1, 1)
 		placeholder.BackgroundTransparency = 1
@@ -456,6 +456,8 @@ local spiritPowerValue = statsFolder:WaitForChild("Spirit Power")
 
 local getAscendStateFunc = ReplicatedStorage:WaitForChild("GetAscendState")
 local ascendFunc = ReplicatedStorage:WaitForChild("Ascend")
+local getSoulJarStateFunc = ReplicatedStorage:WaitForChild("GetSoulJarState")
+local buySoulJarFunc = ReplicatedStorage:WaitForChild("BuySoulJar")
 
 --------------------------------------------------------------------------------
 -- On-screen HUD (always visible, separate from the shop popup)
@@ -504,8 +506,12 @@ local rankCap = Instance.new("UITextSizeConstraint")
 rankCap.MaxTextSize = 34
 rankCap.Parent = rankDisplay
 
+-- Current Soul Jar capacity, kept in sync from the server; used to show the
+-- "held / cap" counter. Defaults to the Clay Jar until the server reports in.
+local currentJarCapacity = 1000
+
 local function updateHudSpirit()
-	spiritCounter.Text = commafy(spiritPowerValue.Value) .. " Spirit Power"
+	spiritCounter.Text = commafy(spiritPowerValue.Value) .. " / " .. commafy(currentJarCapacity)
 end
 
 local function updateHudRank(count)
@@ -657,3 +663,140 @@ openShopEvent.OnClientEvent:Connect(refreshAscend)
 -- Initial draw.
 updateHudSpirit()
 refreshAscend()
+
+--------------------------------------------------------------------------------
+-- Soul Jar tab (storage cap) panel
+--------------------------------------------------------------------------------
+
+local soulJarPanel = panels["Soul Jar"]
+local JAR_BUY_COLOR = Color3.fromRGB(70, 200, 90) -- green when affordable
+local JAR_LOCKED_COLOR = Color3.fromRGB(110, 100, 140) -- muted when unaffordable / maxed
+
+-- Current jar name (big).
+local jarNameLabel = Instance.new("TextLabel")
+jarNameLabel.AnchorPoint = Vector2.new(0.5, 0)
+jarNameLabel.Position = UDim2.new(0.5, 0, 0, 12)
+jarNameLabel.Size = UDim2.new(1, -32, 0, 46)
+jarNameLabel.BackgroundTransparency = 1
+jarNameLabel.Font = FONT
+jarNameLabel.TextSize = 36
+jarNameLabel.TextColor3 = Color3.fromRGB(255, 200, 40)
+jarNameLabel.TextStrokeTransparency = 0.6
+jarNameLabel.Text = "Clay Jar"
+jarNameLabel.ZIndex = 1
+jarNameLabel.Parent = soulJarPanel
+
+-- Current capacity.
+local jarCapLabel = Instance.new("TextLabel")
+jarCapLabel.AnchorPoint = Vector2.new(0.5, 0)
+jarCapLabel.Position = UDim2.new(0.5, 0, 0, 62)
+jarCapLabel.Size = UDim2.new(1, -32, 0, 26)
+jarCapLabel.BackgroundTransparency = 1
+jarCapLabel.Font = FONT
+jarCapLabel.TextSize = 20
+jarCapLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+jarCapLabel.Text = "Holds 1,000 Spirit Power"
+jarCapLabel.ZIndex = 1
+jarCapLabel.Parent = soulJarPanel
+
+-- Next jar info.
+local jarNextLabel = Instance.new("TextLabel")
+jarNextLabel.AnchorPoint = Vector2.new(0.5, 0)
+jarNextLabel.Position = UDim2.new(0.5, 0, 0, 96)
+jarNextLabel.Size = UDim2.new(1, -40, 0, 44)
+jarNextLabel.BackgroundTransparency = 1
+jarNextLabel.Font = FONT
+jarNextLabel.TextSize = 18
+jarNextLabel.TextColor3 = Color3.fromRGB(210, 200, 230)
+jarNextLabel.TextWrapped = true
+jarNextLabel.Text = "Next: Jade Jar (10,000)"
+jarNextLabel.ZIndex = 1
+jarNextLabel.Parent = soulJarPanel
+
+-- BUY button.
+local buyJarButton = Instance.new("TextButton")
+buyJarButton.AnchorPoint = Vector2.new(0.5, 1)
+buyJarButton.Position = UDim2.new(0.5, 0, 1, -16)
+buyJarButton.Size = UDim2.new(1, -40, 0, 56)
+buyJarButton.Font = FONT
+buyJarButton.TextSize = 22
+buyJarButton.TextStrokeTransparency = 0.6
+buyJarButton.AutoButtonColor = false
+buyJarButton.Text = "BUY"
+buyJarButton.ZIndex = 1
+buyJarButton.Parent = soulJarPanel
+round(buyJarButton, 14)
+stroke(buyJarButton, Color3.fromRGB(40, 120, 55), 2)
+
+-- Latest authoritative Soul Jar state from the server. Initialized with complete
+-- placeholder values (not just partial) so the live .Changed handler can never
+-- read a nil field during the first refresh's network round-trip.
+local soulJarData = {
+	currentName = "Clay Jar",
+	currentCapacity = 1000,
+	maxed = false,
+	nextName = "Jade Jar",
+	nextCapacity = 10000,
+	nextCost = 1000,
+}
+
+local function renderSoulJar()
+	jarNameLabel.Text = soulJarData.currentName
+	jarCapLabel.Text = "Holds " .. commafy(soulJarData.currentCapacity) .. " Spirit Power"
+
+	-- Keep the HUD "held / cap" readout in sync with the current jar.
+	currentJarCapacity = soulJarData.currentCapacity
+	updateHudSpirit()
+
+	if soulJarData.maxed then
+		jarNextLabel.Text = "Maximum jar reached!"
+		buyJarButton.Text = "MAX TIER"
+		buyJarButton.BackgroundColor3 = JAR_LOCKED_COLOR
+		buyJarButton.TextColor3 = Color3.fromRGB(225, 220, 235)
+		buyJarButton.AutoButtonColor = false
+		buyJarButton.Active = false
+		return
+	end
+
+	jarNextLabel.Text = "Next: " .. soulJarData.nextName
+		.. "  (holds " .. commafy(soulJarData.nextCapacity) .. ")"
+
+	-- Enabled only when affordable (checked live against Spirit Power).
+	local affordable = spiritPowerValue.Value >= soulJarData.nextCost
+	buyJarButton.Text = "BUY  •  " .. commafy(soulJarData.nextCost) .. " Spirit Power"
+	if affordable then
+		buyJarButton.BackgroundColor3 = JAR_BUY_COLOR
+		buyJarButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+		buyJarButton.AutoButtonColor = true
+		buyJarButton.Active = true
+	else
+		buyJarButton.BackgroundColor3 = JAR_LOCKED_COLOR
+		buyJarButton.TextColor3 = Color3.fromRGB(225, 220, 235)
+		buyJarButton.AutoButtonColor = false
+		buyJarButton.Active = false
+	end
+end
+
+-- Ask the server for the latest Soul Jar state, then redraw.
+local function refreshSoulJar()
+	soulJarData = getSoulJarStateFunc:InvokeServer()
+	renderSoulJar()
+end
+
+-- Buying: the server validates and returns the resulting state (unchanged if the
+-- upgrade was rejected for being maxed or too expensive), which we render.
+buyJarButton.Activated:Connect(function()
+	if not buyJarButton.Active then
+		return
+	end
+	soulJarData = buySoulJarFunc:InvokeServer()
+	renderSoulJar()
+end)
+
+-- Spirit Power changing re-evaluates whether the BUY button is affordable (and
+-- updates the HUD "held / cap" readout via renderSoulJar -> updateHudSpirit).
+spiritPowerValue.Changed:Connect(renderSoulJar)
+
+-- Refresh whenever the shop opens, plus an initial draw.
+openShopEvent.OnClientEvent:Connect(refreshSoulJar)
+refreshSoulJar()

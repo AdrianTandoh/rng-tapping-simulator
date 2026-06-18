@@ -47,38 +47,179 @@ local buyAscendFunc = Instance.new("RemoteFunction")
 buyAscendFunc.Name = "Ascend"
 buyAscendFunc.Parent = ReplicatedStorage
 
---------------------------------------------------------------------------------
--- 2. Give every player a leaderstats folder
---------------------------------------------------------------------------------
--- Roblox automatically shows any IntValue/NumberValue inside a "leaderstats"
--- folder on the in-game leaderboard. We create one Spirit Power value per player.
+-- Client invokes this to read its current Soul Jar state (tier/capacity/price).
+local getSoulJarStateFunc = Instance.new("RemoteFunction")
+getSoulJarStateFunc.Name = "GetSoulJarState"
+getSoulJarStateFunc.Parent = ReplicatedStorage
 
--- Server-authoritative per-player progression, declared here (before
--- setupLeaderstats) so the leaderstats setup can seed them.
-local zenLevel = {} -- [player] = Zen level (number, starts at 0)
-local ascendCount = {} -- [player] = number of times Ascended (starts at 0)
+-- Client invokes this to request a Soul Jar upgrade. The SERVER validates and
+-- returns the resulting (authoritative) Soul Jar state either way.
+local buySoulJarFunc = Instance.new("RemoteFunction")
+buySoulJarFunc.Name = "BuySoulJar"
+buySoulJarFunc.Parent = ReplicatedStorage
 
+--------------------------------------------------------------------------------
+-- 2. Player progression tables
+--------------------------------------------------------------------------------
+-- Server-authoritative per-player progression, declared up front so the data
+-- loading + leaderstats setup below can seed them.
+local zenLevel = {} -- [player] = Zen level (starts at 0)
+local ascendCount = {} -- [player] = times Ascended (starts at 0)
+local jarTier = {} -- [player] = Soul Jar tier index (0 = Clay, starts at 0)
+local canSave = {} -- [player] = true ONLY if their data loaded cleanly (see 2c)
+
+--------------------------------------------------------------------------------
+-- 2b. Soul Jar (storage cap) configuration
+--------------------------------------------------------------------------------
+-- The Soul Jar caps how much Spirit Power a player can HOLD. Tiers are an ordered
+-- list (index 1 = tier 0 = Clay, the default). `upgradeCost` is the price to buy
+-- THIS tier from the previous one (Clay is free / owned by default).
+--
+-- PRICING NOTE: the design hint suggested "~half the next tier's capacity", but
+-- since Spirit Power is hard-clamped to the CURRENT jar, a price above the
+-- current capacity could never be afforded. So each upgrade instead costs the
+-- current jar's full capacity (fill it, then upgrade) — always reachable. Edit
+-- these numbers freely.
+local SOUL_JAR_TIERS = {
+	{ name = "Clay Jar", capacity = 1000, upgradeCost = 0 }, -- starting tier (owned)
+	{ name = "Jade Jar", capacity = 10000, upgradeCost = 1000 },
+	{ name = "Crystal Jar", capacity = 100000, upgradeCost = 10000 },
+	{ name = "Obsidian Jar", capacity = 1000000, upgradeCost = 100000 },
+	{ name = "Phoenix Urn", capacity = 10000000, upgradeCost = 1000000 },
+	{ name = "Dragon Vessel", capacity = 100000000, upgradeCost = 10000000 },
+	{ name = "Astral Chalice", capacity = 1000000000, upgradeCost = 100000000 },
+	{ name = "Eternal Reliquary", capacity = 10000000000, upgradeCost = 1000000000 },
+}
+
+-- The Spirit Power cap for a player's current jar.
+local function getSpiritCap(player)
+	local tier = jarTier[player] or 0
+	return SOUL_JAR_TIERS[tier + 1].capacity
+end
+
+--------------------------------------------------------------------------------
+-- 2c. DataStore saving / loading
+--------------------------------------------------------------------------------
+-- Persists the four progress values (Spirit Power, Zen, Ascend, Jar) per UserId.
+-- Every DataStore call is wrapped in pcall because they can throw.
+local DataStoreService = game:GetService("DataStoreService")
+
+local DATASTORE_NAME = "AncientSpiritData" -- single store
+local DATA_KEY_VERSION = "PlayerData_v1" -- versioned key prefix; bump to migrate
+local SAVE_MAX_ATTEMPTS = 3 -- retry a failing SAVE up to this many times
+local SAVE_RETRY_DELAY = 2 -- seconds to wait between save retries
+
+local dataStore = DataStoreService:GetDataStore(DATASTORE_NAME)
+
+local function dataKey(player)
+	return DATA_KEY_VERSION .. "_" .. player.UserId
+end
+
+-- Fresh default progress for a brand-new player.
+local function makeDefaults()
+	return { SpiritPower = 0, ZenLevel = 0, AscendCount = 0, JarTier = 0 }
+end
+
+-- Returns: dataTable, loadOk(boolean).
+-- loadOk is false ONLY when the DataStore call actually errored. A brand-new
+-- player (no saved data) is a SUCCESSFUL load that returns defaults.
+local function loadPlayerData(player)
+	local ok, result = pcall(function()
+		return dataStore:GetAsync(dataKey(player))
+	end)
+
+	if not ok then
+		-- The call failed. Do NOT treat this as "new player" — that would risk
+		-- overwriting good saved data with defaults. Use defaults for THIS
+		-- session only and forbid saving (canSave stays false).
+		warn("[Save] LOAD FAILED for " .. player.Name .. ": " .. tostring(result))
+		return makeDefaults(), false
+	end
+
+	if result == nil then
+		return makeDefaults(), true -- brand-new player
+	end
+
+	-- Existing data: read each field defensively.
+	return {
+		SpiritPower = tonumber(result.SpiritPower) or 0,
+		ZenLevel = tonumber(result.ZenLevel) or 0,
+		AscendCount = tonumber(result.AscendCount) or 0,
+		JarTier = tonumber(result.JarTier) or 0,
+	}, true
+end
+
+-- Saves a player's current progress, with simple retries. Skips entirely if the
+-- player's data never loaded cleanly, which protects their real save from being
+-- clobbered by this session's defaults.
+local function savePlayerData(player)
+	if not canSave[player] then
+		warn("[Save] Skipping save for " .. player.Name .. " — data did not load cleanly this session; protecting existing save.")
+		return
+	end
+
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
+	local data = {
+		SpiritPower = spiritPower and spiritPower.Value or 0,
+		ZenLevel = zenLevel[player] or 0,
+		AscendCount = ascendCount[player] or 0,
+		JarTier = jarTier[player] or 0,
+	}
+
+	local attempt = 0
+	local ok, err
+	repeat
+		attempt += 1
+		ok, err = pcall(function()
+			dataStore:SetAsync(dataKey(player), data)
+		end)
+		if not ok then
+			warn("[Save] SAVE attempt " .. attempt .. " failed for " .. player.Name .. ": " .. tostring(err))
+			if attempt < SAVE_MAX_ATTEMPTS then
+				task.wait(SAVE_RETRY_DELAY)
+			end
+		end
+	until ok or attempt >= SAVE_MAX_ATTEMPTS
+
+	if ok then
+		print("[Save] Saved progress for " .. player.Name)
+	else
+		warn("[Save] GAVE UP saving for " .. player.Name .. " after " .. attempt .. " attempts.")
+	end
+end
+
+--------------------------------------------------------------------------------
+-- 2d. Player join: load data, then build leaderstats
+--------------------------------------------------------------------------------
+-- Roblox shows any IntValue inside a "leaderstats" folder on the leaderboard.
 local function setupLeaderstats(player)
+	-- Load first so everything is seeded from saved progress (or defaults).
+	local data, loadOk = loadPlayerData(player)
+	canSave[player] = loadOk -- only allow saving if the load was clean
+
+	zenLevel[player] = data.ZenLevel
+	ascendCount[player] = data.AscendCount
+	jarTier[player] = data.JarTier
+
 	local leaderstats = Instance.new("Folder")
 	leaderstats.Name = "leaderstats"
 
 	local spiritPower = Instance.new("IntValue")
 	spiritPower.Name = "Spirit Power"
-	spiritPower.Value = 0 -- everyone starts with zero
+	-- Clamp to the (now-known) jar capacity in case saved data somehow exceeds it.
+	spiritPower.Value = math.min(data.SpiritPower, getSpiritCap(player))
 	spiritPower.Parent = leaderstats
 
 	leaderstats.Parent = player
-
-	-- Start every player at Zen level 0 (x1 click multiplier) and Ascend count 0.
-	zenLevel[player] = 0
-	ascendCount[player] = 0
 end
 
 -- Handle players who join after this script runs...
 Players.PlayerAdded:Connect(setupLeaderstats)
--- ...and any players who somehow already exist (e.g. fast Studio start).
+-- ...and any players who already exist (e.g. fast Studio start / script reload).
+-- task.spawn so a slow load for one doesn't block the others or script init.
 for _, player in ipairs(Players:GetPlayers()) do
-	setupLeaderstats(player)
+	task.spawn(setupLeaderstats, player)
 end
 
 --------------------------------------------------------------------------------
@@ -102,8 +243,11 @@ local function grantSpiritPower(player, amount)
 	local leaderstats = player:FindFirstChild("leaderstats")
 	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
 	if spiritPower then
-		-- Apply the permanent Ascend multiplier, then floor to a whole number.
-		spiritPower.Value += math.floor(amount * getAscendMultiplier(player))
+		-- Apply the permanent Ascend multiplier and floor to a whole number, then
+		-- SOFT-CAP to the Soul Jar capacity: overflow beyond the cap is discarded
+		-- (clicks still register; clicking while full simply wastes the excess).
+		local gain = math.floor(amount * getAscendMultiplier(player))
+		spiritPower.Value = math.min(spiritPower.Value + gain, getSpiritCap(player))
 	end
 end
 
@@ -225,7 +369,57 @@ buyAscendFunc.OnServerInvoke = function(player)
 	spiritPower.Value = 0
 	zenLevel[player] = 0
 	ascendCount[player] = count + 1
+	-- NOTE: JarTier is intentionally NOT touched here — the Soul Jar persists
+	-- across Ascends.
 	return getAscendState(player)
+end
+
+--------------------------------------------------------------------------------
+-- 3d. Soul Jar purchases
+--------------------------------------------------------------------------------
+-- Snapshot of a player's Soul Jar state for the client to render.
+local function getSoulJarState(player)
+	local tier = jarTier[player] or 0
+	local current = SOUL_JAR_TIERS[tier + 1]
+	local nextTier = SOUL_JAR_TIERS[tier + 2] -- nil when already at the top
+	return {
+		tier = tier,
+		currentName = current.name,
+		currentCapacity = current.capacity,
+		maxed = nextTier == nil,
+		nextName = nextTier and nextTier.name or nil,
+		nextCapacity = nextTier and nextTier.capacity or nil,
+		nextCost = nextTier and nextTier.upgradeCost or nil,
+	}
+end
+
+-- Client asks for its current Soul Jar state (on shop open / startup).
+getSoulJarStateFunc.OnServerInvoke = function(player)
+	return getSoulJarState(player)
+end
+
+-- Upgrade handler — fully validated on the server.
+buySoulJarFunc.OnServerInvoke = function(player)
+	local tier = jarTier[player] or 0
+	local nextTier = SOUL_JAR_TIERS[tier + 2]
+
+	-- Reject if already at the top tier.
+	if not nextTier then
+		return getSoulJarState(player) -- unchanged
+	end
+
+	-- Reject if the player can't afford the upgrade.
+	local cost = nextTier.upgradeCost
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
+	if not spiritPower or spiritPower.Value < cost then
+		return getSoulJarState(player) -- unchanged
+	end
+
+	-- Valid purchase: deduct cost and advance the tier.
+	spiritPower.Value -= cost
+	jarTier[player] = tier + 1
+	return getSoulJarState(player)
 end
 
 --------------------------------------------------------------------------------
@@ -318,12 +512,42 @@ shopPad.Touched:Connect(function(hit)
 end)
 
 --------------------------------------------------------------------------------
--- 6. Per-player cleanup
+-- 6. Save on leave + per-player cleanup
 --------------------------------------------------------------------------------
--- Drop a leaving player's bookkeeping so the tables don't grow forever.
 Players.PlayerRemoving:Connect(function(player)
+	-- Save BEFORE clearing the tables that savePlayerData reads from.
+	savePlayerData(player)
+
 	lastClickTime[player] = nil
 	touchDebounce[player] = nil
 	zenLevel[player] = nil
 	ascendCount[player] = nil
+	jarTier[player] = nil
+	canSave[player] = nil
+end)
+
+--------------------------------------------------------------------------------
+-- 7. Save everyone on server shutdown
+--------------------------------------------------------------------------------
+-- BindToClose runs when the server shuts down, so progress isn't lost on close.
+-- Saves run in parallel and we wait (up to a budget) for them to finish.
+game:BindToClose(function()
+	local players = Players:GetPlayers()
+	local remaining = #players
+	if remaining == 0 then
+		return
+	end
+
+	for _, player in ipairs(players) do
+		task.spawn(function()
+			savePlayerData(player)
+			remaining -= 1
+		end)
+	end
+
+	-- Wait for the saves to complete, but never exceed the shutdown budget.
+	local elapsed = 0
+	while remaining > 0 and elapsed < 25 do
+		elapsed += task.wait()
+	end
 end)
