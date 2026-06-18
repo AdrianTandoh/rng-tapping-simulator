@@ -1,42 +1,29 @@
 -- Ancient Spirit Simulator
--- Feature 1: Core meditation loop
+-- Core earning mechanic: CLICK-TO-EARN (server-authoritative)
 --
--- Players earn the "Spirit Power" stat by standing on a meditation pad.
--- Everything here runs on the SERVER, so the game is server-authoritative:
--- the client can never directly change a player's Spirit Power.
+-- Players earn the "Spirit Power" stat by clicking the game world. The client
+-- only *detects* clicks and asks the server to grant power; the server is the
+-- single source of truth and the only thing that ever changes Spirit Power.
 
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 
--- How much Spirit Power to grant for each full second spent meditating.
-local POWER_PER_SECOND = 5
-
 --------------------------------------------------------------------------------
--- 1. Build the meditation pad
+-- 1. RemoteEvents
 --------------------------------------------------------------------------------
--- We create the pad from code so nothing has to be placed manually in Studio.
--- It's an anchored, glowing (Neon) part sitting at the world origin, resting on
--- top of the baseplate so players can walk onto it.
+-- Created here on the server and parented to ReplicatedStorage so the client can
+-- safely find them with WaitForChild.
 
-local pad = Instance.new("Part")
-pad.Name = "MeditationPad"
-pad.Size = Vector3.new(12, 1, 12)
--- Position so the pad's bottom sits on the baseplate top (y = 0) and its
--- walkable surface is at y = 1. Centered on the world origin.
-pad.Position = Vector3.new(0, 0.5, 0)
-pad.Anchored = true -- never falls or gets pushed around
-pad.Material = Enum.Material.Neon -- makes it glow
-pad.Color = Color3.fromRGB(120, 220, 255) -- soft spirit-blue
-pad.TopSurface = Enum.SurfaceType.Smooth
-pad.BottomSurface = Enum.SurfaceType.Smooth
-pad.Parent = Workspace
+-- Fired by the client on each valid world click; server grants Spirit Power.
+local clickEarnEvent = Instance.new("RemoteEvent")
+clickEarnEvent.Name = "ClickEarn"
+clickEarnEvent.Parent = ReplicatedStorage
 
--- Precompute the pad's top surface height and horizontal half-size once.
--- We use these every frame to test whether a player is standing on the pad.
-local padTopY = pad.Position.Y + pad.Size.Y / 2
-local padHalfX = pad.Size.X / 2
-local padHalfZ = pad.Size.Z / 2
+-- Fired by the server to ask a client to open its shop popup (touch the pad).
+local openShopEvent = Instance.new("RemoteEvent")
+openShopEvent.Name = "OpenShop"
+openShopEvent.Parent = ReplicatedStorage
 
 --------------------------------------------------------------------------------
 -- 2. Give every player a leaderstats folder
@@ -64,70 +51,109 @@ for _, player in ipairs(Players:GetPlayers()) do
 end
 
 --------------------------------------------------------------------------------
--- 3. Decide whether a player is standing on the pad
+-- 3. Single chokepoint for granting Spirit Power
 --------------------------------------------------------------------------------
--- We check the player's HumanoidRootPart against the pad's bounds rather than
--- relying on Touched events, which can be unreliable. A player counts as "on
--- the pad" if they are alive, horizontally within the pad, and resting near its
--- top surface.
+-- ALL Spirit Power changes go through this one function. Right now only the
+-- click handler calls it (amount = 1), but a future auto-clicker can call the
+-- exact same function, so there's only ever one place that touches the stat.
 
-local function isStandingOnPad(player)
-	local character = player.Character
-	if not character then
-		return false
+local function grantSpiritPower(player, amount)
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
+	if spiritPower then
+		spiritPower.Value += amount
 	end
-
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	local root = character:FindFirstChild("HumanoidRootPart")
-	if not humanoid or not root or humanoid.Health <= 0 then
-		return false
-	end
-
-	local position = root.Position
-
-	-- Horizontal check: are they over the pad footprint?
-	if math.abs(position.X - pad.Position.X) > padHalfX then
-		return false
-	end
-	if math.abs(position.Z - pad.Position.Z) > padHalfZ then
-		return false
-	end
-
-	-- Vertical check: are they roughly at pad level (not flying overhead or
-	-- standing under it)? The root part floats a few studs above the feet.
-	if position.Y < padTopY or position.Y > padTopY + 6 then
-		return false
-	end
-
-	return true
 end
 
 --------------------------------------------------------------------------------
--- 4. The meditation loop (Heartbeat-based per-second timer)
+-- 4. Click-to-earn with a simple rate limit
 --------------------------------------------------------------------------------
--- Heartbeat fires every frame and hands us the time since the last frame (dt).
--- We accumulate that time and, once a full second has passed, grant Spirit Power
--- to every player currently standing on the pad. This avoids wait() loops and
--- keeps the timing accurate regardless of frame rate.
+-- Basic anti-exploit protection: a client could be hacked to fire the RemoteEvent
+-- thousands of times per second. We record when each player's last click was
+-- accepted and silently ignore any click that arrives sooner than a human could
+-- realistically click. This is intentionally minimal, not full anti-cheat.
 
-local accumulator = 0
+local MIN_CLICK_GAP = 0.05 -- seconds between accepted clicks (~20 clicks/sec cap)
+local lastClickTime = {} -- [player] = os.clock() of last accepted click
 
-RunService.Heartbeat:Connect(function(dt)
-	accumulator += dt
+clickEarnEvent.OnServerEvent:Connect(function(player)
+	local now = os.clock()
+	local last = lastClickTime[player]
 
-	-- Award once per whole second. A "while" handles the rare case where a
-	-- frame hitch makes more than one second pass at once.
-	while accumulator >= 1 do
-		accumulator -= 1
-
-		for _, player in ipairs(Players:GetPlayers()) do
-			if isStandingOnPad(player) then
-				local leaderstats = player:FindFirstChild("leaderstats")
-				local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
-				if spiritPower then
-					spiritPower.Value += POWER_PER_SECOND
-				end
-			end
-		end
+	-- Reject clicks that come in faster than the allowed gap.
+	if last and (now - last) < MIN_CLICK_GAP then
+		return
 	end
+
+	lastClickTime[player] = now
+	grantSpiritPower(player, 1) -- one click = +1 Spirit Power
+end)
+
+--------------------------------------------------------------------------------
+-- 5. The Shop pad
+--------------------------------------------------------------------------------
+-- A pad that opens the shop UI when touched. The actual GUI is built on the
+-- client (UI is client-only); the server just owns the pad and tells the
+-- touching player's client to open the shop via the OpenShop RemoteEvent.
+
+-- Build the gold shop pad, set off to the side near the world origin.
+local shopPad = Instance.new("Part")
+shopPad.Name = "ShopPad"
+shopPad.Size = Vector3.new(12, 1, 12)
+shopPad.Position = Vector3.new(24, 0.5, 0) -- 24 studs from origin
+shopPad.Anchored = true
+shopPad.Material = Enum.Material.Neon -- glowing
+shopPad.Color = Color3.fromRGB(255, 200, 40) -- bright gold
+shopPad.TopSurface = Enum.SurfaceType.Smooth
+shopPad.BottomSurface = Enum.SurfaceType.Smooth
+shopPad.Parent = Workspace
+
+-- Floating "SHOP" label hovering above the pad.
+local label = Instance.new("BillboardGui")
+label.Name = "ShopLabel"
+label.Size = UDim2.fromScale(6, 1.5) -- in studs (Adornee scale)
+label.StudsOffsetWorldSpace = Vector3.new(0, 4, 0) -- float above the pad
+label.AlwaysOnTop = true
+label.Adornee = shopPad
+
+local labelText = Instance.new("TextLabel")
+labelText.Size = UDim2.fromScale(1, 1)
+labelText.BackgroundTransparency = 1
+labelText.Text = "SHOP"
+labelText.Font = Enum.Font.GothamBold
+labelText.TextScaled = true
+labelText.TextColor3 = Color3.fromRGB(255, 255, 255)
+labelText.TextStrokeTransparency = 0.4
+labelText.TextStrokeColor3 = Color3.fromRGB(120, 80, 0)
+labelText.Parent = label
+
+label.Parent = shopPad
+
+-- Fire the open event when a player touches the pad. We add a short per-player
+-- debounce so a single step-on doesn't spam the remote dozens of times per
+-- second. The client safely ignores the event if the shop is already open.
+local touchDebounce = {} -- [player] = true while on cooldown
+
+shopPad.Touched:Connect(function(hit)
+	local character = hit.Parent
+	local player = character and Players:GetPlayerFromCharacter(character)
+	if not player or touchDebounce[player] then
+		return
+	end
+
+	touchDebounce[player] = true
+	openShopEvent:FireClient(player)
+
+	task.delay(1, function()
+		touchDebounce[player] = nil
+	end)
+end)
+
+--------------------------------------------------------------------------------
+-- 6. Per-player cleanup
+--------------------------------------------------------------------------------
+-- Drop a leaving player's bookkeeping so the tables don't grow forever.
+Players.PlayerRemoving:Connect(function(player)
+	lastClickTime[player] = nil
+	touchDebounce[player] = nil
 end)
