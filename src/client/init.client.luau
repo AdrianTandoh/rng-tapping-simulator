@@ -13,7 +13,8 @@ local playerGui = player:WaitForChild("PlayerGui")
 local openShopEvent = ReplicatedStorage:WaitForChild("OpenShop")
 
 -- Tab definitions: order here is the order shown along the top.
-local TABS = { "Zen", "Soul Jar", "Ascend" }
+-- Ascend moved out to its own world pad/popup, so the shop is just Zen + Soul Jar.
+local TABS = { "Zen", "Soul Jar" }
 local DEFAULT_TAB = "Zen"
 
 -- Playful UI font used everywhere (HUD + shop).
@@ -46,6 +47,33 @@ local function stroke(instance, color, thickness)
 end
 
 --------------------------------------------------------------------------------
+-- Popup manager: only ONE popup open at a time
+--------------------------------------------------------------------------------
+-- Every popup (Shop, Ascend, Group Rewards, and any future ones) registers its
+-- ScreenGui here. Opening one through PopupManager.open() automatically closes
+-- every other registered popup, so two can never be open at once. Adding a new
+-- popup later is just: register(gui) once, then open(gui) / close(gui).
+local GuiService = game:GetService("GuiService")
+
+local PopupManager = {}
+PopupManager._registered = {} -- list of ScreenGuis
+
+function PopupManager.register(gui)
+	table.insert(PopupManager._registered, gui)
+end
+
+function PopupManager.open(gui)
+	-- Enable the requested popup, disable all the others.
+	for _, other in ipairs(PopupManager._registered) do
+		other.Enabled = (other == gui)
+	end
+end
+
+function PopupManager.close(gui)
+	gui.Enabled = false
+end
+
+--------------------------------------------------------------------------------
 -- Build the popup once, keep it hidden, and just toggle visibility
 --------------------------------------------------------------------------------
 -- Building it a single time (instead of rebuilding on every touch) is what makes
@@ -57,6 +85,7 @@ screenGui.ResetOnSpawn = false -- survive respawns
 screenGui.IgnoreGuiInset = true
 screenGui.Enabled = false -- hidden until the player touches the pad
 screenGui.Parent = playerGui
+PopupManager.register(screenGui)
 
 -- Soft drop shadow: a slightly larger dark frame sitting behind the main frame.
 local shadow = Instance.new("Frame")
@@ -197,7 +226,7 @@ for index, name in ipairs(TABS) do
 	panel.Parent = content
 	panels[name] = panel
 
-	if name ~= "Zen" and name ~= "Ascend" and name ~= "Soul Jar" then
+	if name ~= "Zen" and name ~= "Soul Jar" then
 		local placeholder = Instance.new("TextLabel")
 		placeholder.Size = UDim2.fromScale(1, 1)
 		placeholder.BackgroundTransparency = 1
@@ -237,11 +266,11 @@ end
 
 local function openShop()
 	selectTab(DEFAULT_TAB) -- always start on the default tab
-	screenGui.Enabled = true
+	PopupManager.open(screenGui) -- closes any other open popup
 end
 
 local function closeShop()
-	screenGui.Enabled = false
+	PopupManager.close(screenGui)
 end
 
 closeButton.Activated:Connect(closeShop)
@@ -453,9 +482,13 @@ end
 
 local statsFolder = player:WaitForChild("leaderstats")
 local spiritPowerValue = statsFolder:WaitForChild("Spirit Power")
+-- Chi is the second currency: a replicated IntValue parented to the Player (not in
+-- leaderstats). The server owns it; we only watch it to drive the HUD counter.
+local chiValue = player:WaitForChild("Chi")
 
 local getAscendStateFunc = ReplicatedStorage:WaitForChild("GetAscendState")
 local ascendFunc = ReplicatedStorage:WaitForChild("Ascend")
+local openAscendEvent = ReplicatedStorage:WaitForChild("OpenAscend")
 local getSoulJarStateFunc = ReplicatedStorage:WaitForChild("GetSoulJarState")
 local buySoulJarFunc = ReplicatedStorage:WaitForChild("BuySoulJar")
 
@@ -469,49 +502,146 @@ hud.ResetOnSpawn = false
 hud.IgnoreGuiInset = true
 hud.Parent = playerGui
 
--- Big SILVER Spirit Power counter, top-center.
-local spiritCounter = Instance.new("TextLabel")
-spiritCounter.Name = "SpiritCounter"
-spiritCounter.AnchorPoint = Vector2.new(0.5, 0)
-spiritCounter.Position = UDim2.new(0.5, 0, 0, 14)
-spiritCounter.Size = UDim2.fromOffset(460, 52)
-spiritCounter.BackgroundTransparency = 1
-spiritCounter.Font = FONT
-spiritCounter.TextScaled = true
-spiritCounter.TextColor3 = Color3.fromRGB(205, 210, 220) -- silver
-spiritCounter.TextStrokeTransparency = 0.35
-spiritCounter.TextStrokeColor3 = Color3.fromRGB(40, 40, 55)
-spiritCounter.Text = "0 Spirit Power"
-spiritCounter.Parent = hud
+-- The whole HUD is a centered vertical stack: rank title, then the Spirit Power
+-- "vessel" bar, then the Chi bank counter. A UIListLayout keeps the three pieces
+-- tidy and non-overlapping regardless of text length.
+local hudStack = Instance.new("Frame")
+hudStack.Name = "Stack"
+hudStack.AnchorPoint = Vector2.new(0.5, 0)
+hudStack.Position = UDim2.new(0.5, 0, 0, 12)
+hudStack.Size = UDim2.fromOffset(440, 150)
+hudStack.BackgroundTransparency = 1
+hudStack.Parent = hud
 
-local spiritCap = Instance.new("UITextSizeConstraint")
-spiritCap.MaxTextSize = 44
-spiritCap.Parent = spiritCounter
+local hudLayout = Instance.new("UIListLayout")
+hudLayout.FillDirection = Enum.FillDirection.Vertical
+hudLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+hudLayout.SortOrder = Enum.SortOrder.LayoutOrder
+hudLayout.Padding = UDim.new(0, 8)
+hudLayout.Parent = hudStack
 
--- Big COLOR-CODED rank title, just below the counter.
+-- (1) Big COLOR-CODED rank title at the top of the stack.
 local rankDisplay = Instance.new("TextLabel")
 rankDisplay.Name = "RankDisplay"
-rankDisplay.AnchorPoint = Vector2.new(0.5, 0)
-rankDisplay.Position = UDim2.new(0.5, 0, 0, 66)
-rankDisplay.Size = UDim2.fromOffset(360, 40)
+rankDisplay.LayoutOrder = 1
+rankDisplay.Size = UDim2.fromOffset(360, 38)
 rankDisplay.BackgroundTransparency = 1
 rankDisplay.Font = FONT
 rankDisplay.TextScaled = true
 rankDisplay.TextStrokeTransparency = 0.45
 rankDisplay.TextStrokeColor3 = Color3.fromRGB(20, 20, 28)
 rankDisplay.Text = "Seeker"
-rankDisplay.Parent = hud
+rankDisplay.Parent = hudStack
 
 local rankCap = Instance.new("UITextSizeConstraint")
 rankCap.MaxTextSize = 34
 rankCap.Parent = rankDisplay
 
--- Current Soul Jar capacity, kept in sync from the server; used to show the
--- "held / cap" counter. Defaults to the Clay Jar until the server reports in.
+-- (2) SILVER Spirit Power vessel BAR. A dark rounded track with a silver fill that
+-- grows toward the current Soul Jar capacity, plus the "held / cap" text on top —
+-- so the player can literally see their vessel filling ("getting full, time to
+-- convert"). Keeps the silver styling of the old counter.
+local spiritBar = Instance.new("Frame")
+spiritBar.Name = "SpiritBar"
+spiritBar.LayoutOrder = 2
+spiritBar.Size = UDim2.fromOffset(420, 46)
+spiritBar.BackgroundColor3 = Color3.fromRGB(38, 40, 52) -- dark track behind the fill
+spiritBar.Parent = hudStack
+round(spiritBar, 14)
+stroke(spiritBar, Color3.fromRGB(120, 126, 140), 2) -- silver rim
+
+-- The fill. Its width scales 0..1 with held/cap; its own rounded corners match the
+-- track so the left end stays clean at any fill level.
+local spiritFill = Instance.new("Frame")
+spiritFill.Name = "Fill"
+spiritFill.AnchorPoint = Vector2.new(0, 0.5)
+spiritFill.Position = UDim2.fromScale(0, 0.5)
+spiritFill.Size = UDim2.fromScale(0, 1)
+spiritFill.BackgroundColor3 = Color3.fromRGB(190, 196, 210) -- silver
+spiritFill.BorderSizePixel = 0
+spiritFill.Parent = spiritBar
+round(spiritFill, 14)
+
+-- Subtle vertical sheen so the silver fill reads as a polished metal vessel.
+local fillGradient = Instance.new("UIGradient")
+fillGradient.Rotation = 90
+fillGradient.Color = ColorSequence.new(
+	Color3.fromRGB(228, 232, 242),
+	Color3.fromRGB(148, 154, 170)
+)
+fillGradient.Parent = spiritFill
+
+-- "held / cap" text, centered over the bar. White with a strong stroke so it stays
+-- readable over both the dark empty track and the light silver fill.
+local spiritText = Instance.new("TextLabel")
+spiritText.Name = "Text"
+spiritText.Size = UDim2.fromScale(1, 1)
+spiritText.BackgroundTransparency = 1
+spiritText.Font = FONT
+spiritText.TextScaled = true
+spiritText.Text = "0 / 1,000"
+spiritText.TextColor3 = Color3.fromRGB(245, 247, 250)
+spiritText.TextStrokeTransparency = 0.35
+spiritText.TextStrokeColor3 = Color3.fromRGB(28, 30, 40)
+spiritText.ZIndex = 2
+spiritText.Parent = spiritBar
+
+local spiritTextPad = Instance.new("UIPadding")
+spiritTextPad.PaddingTop = UDim.new(0, 8)
+spiritTextPad.PaddingBottom = UDim.new(0, 8)
+spiritTextPad.Parent = spiritText
+
+local spiritCap = Instance.new("UITextSizeConstraint")
+spiritCap.MaxTextSize = 24
+spiritCap.Parent = spiritText
+
+-- (3) Chi bank COUNTER. A distinct jade pill (Spirit Power = silver, Chi = jade)
+-- so the two currencies never read as the same thing. This is the spendable bank.
+local chiCounter = Instance.new("Frame")
+chiCounter.Name = "ChiCounter"
+chiCounter.LayoutOrder = 3
+chiCounter.Size = UDim2.fromOffset(220, 36)
+chiCounter.BackgroundColor3 = Color3.fromRGB(30, 56, 48) -- deep jade
+chiCounter.Parent = hudStack
+round(chiCounter, 12)
+stroke(chiCounter, Color3.fromRGB(90, 210, 160), 2) -- jade-green rim
+
+local chiLabel = Instance.new("TextLabel")
+chiLabel.Name = "Text"
+chiLabel.Size = UDim2.fromScale(1, 1)
+chiLabel.BackgroundTransparency = 1
+chiLabel.Font = FONT
+chiLabel.TextScaled = true
+chiLabel.Text = "0 Chi"
+chiLabel.TextColor3 = Color3.fromRGB(150, 240, 200) -- jade
+chiLabel.TextStrokeTransparency = 0.5
+chiLabel.TextStrokeColor3 = Color3.fromRGB(12, 28, 22)
+chiLabel.Parent = chiCounter
+
+local chiTextPad = Instance.new("UIPadding")
+chiTextPad.PaddingTop = UDim.new(0, 6)
+chiTextPad.PaddingBottom = UDim.new(0, 6)
+chiTextPad.Parent = chiLabel
+
+local chiCap = Instance.new("UITextSizeConstraint")
+chiCap.MaxTextSize = 22
+chiCap.Parent = chiLabel
+
+-- Current Soul Jar capacity, kept in sync from the server; the bar fills toward it.
+-- Defaults to the Clay Jar until the server reports in.
 local currentJarCapacity = 1000
 
 local function updateHudSpirit()
-	spiritCounter.Text = commafy(spiritPowerValue.Value) .. " / " .. commafy(currentJarCapacity)
+	local held = spiritPowerValue.Value
+	local cap = currentJarCapacity
+	-- Fraction of the vessel that's full (guard against a 0/None capacity).
+	local frac = cap > 0 and math.clamp(held / cap, 0, 1) or 0
+	spiritFill.Size = UDim2.fromScale(frac, 1)
+	spiritText.Text = commafy(held) .. " / " .. commafy(cap)
+end
+
+local function updateHudChi()
+	chiLabel.Text = commafy(chiValue.Value) .. " Chi"
 end
 
 local function updateHudRank(count)
@@ -519,13 +649,106 @@ local function updateHudRank(count)
 	rankDisplay.TextColor3 = getRankColor(count)
 end
 
---------------------------------------------------------------------------------
--- Ascend tab (prestige) panel
---------------------------------------------------------------------------------
+-- Chi is read-only on the client: keep the counter in sync whenever the server
+-- changes it, plus an initial draw.
+chiValue.Changed:Connect(updateHudChi)
+updateHudChi()
 
-local ascendPanel = panels["Ascend"]
+--------------------------------------------------------------------------------
+-- Ascend popup (prestige — standalone, opened by the cyan Ascend world pad)
+--------------------------------------------------------------------------------
+-- Moved out of the shop into its own popup. The Ascend mechanics/logic are
+-- unchanged; only the trigger moved (the Ascend pad fires OpenAscend).
+
 local ASCEND_READY_COLOR = Color3.fromRGB(255, 200, 40) -- gold when ready
 local ASCEND_LOCKED_COLOR = Color3.fromRGB(110, 100, 140) -- muted when locked
+local ASCEND_ACCENT = Color3.fromRGB(40, 220, 220) -- cyan/teal, matches the pad
+
+-- Built once, hidden, toggled via the popup manager (like the shop popup).
+local ascendGui = Instance.new("ScreenGui")
+ascendGui.Name = "AscendGui"
+ascendGui.ResetOnSpawn = false
+ascendGui.IgnoreGuiInset = true
+ascendGui.Enabled = false
+ascendGui.Parent = playerGui
+PopupManager.register(ascendGui)
+
+local ascendShadow = Instance.new("Frame")
+ascendShadow.Name = "Shadow"
+ascendShadow.AnchorPoint = Vector2.new(0.5, 0.5)
+ascendShadow.Position = UDim2.new(0.5, 0, 0.5, 6)
+ascendShadow.Size = UDim2.fromOffset(540, 420)
+ascendShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+ascendShadow.BackgroundTransparency = 0.6
+ascendShadow.ZIndex = 0
+ascendShadow.Parent = ascendGui
+round(ascendShadow, 22)
+
+local ascendMain = Instance.new("Frame")
+ascendMain.Name = "Main"
+ascendMain.AnchorPoint = Vector2.new(0.5, 0.5)
+ascendMain.Position = UDim2.fromScale(0.5, 0.5)
+ascendMain.Size = UDim2.fromOffset(520, 400)
+ascendMain.BackgroundColor3 = Color3.fromRGB(45, 35, 70)
+ascendMain.ZIndex = 1
+ascendMain.Parent = ascendGui
+round(ascendMain, 20)
+stroke(ascendMain, ASCEND_ACCENT, 3) -- cyan outline
+
+local ascendHeader = Instance.new("Frame")
+ascendHeader.Name = "Header"
+ascendHeader.Size = UDim2.new(1, 0, 0, 64)
+ascendHeader.BackgroundColor3 = Color3.fromRGB(30, 120, 130) -- teal
+ascendHeader.ZIndex = 2
+ascendHeader.Parent = ascendMain
+round(ascendHeader, 20)
+
+local ascendHeaderCover = Instance.new("Frame")
+ascendHeaderCover.Size = UDim2.new(1, 0, 0, 24)
+ascendHeaderCover.Position = UDim2.new(0, 0, 1, -24)
+ascendHeaderCover.BackgroundColor3 = ascendHeader.BackgroundColor3
+ascendHeaderCover.BorderSizePixel = 0
+ascendHeaderCover.ZIndex = 2
+ascendHeaderCover.Parent = ascendHeader
+
+local ascendHeaderTitle = Instance.new("TextLabel")
+ascendHeaderTitle.Size = UDim2.new(1, -80, 1, 0)
+ascendHeaderTitle.Position = UDim2.fromOffset(20, 0)
+ascendHeaderTitle.BackgroundTransparency = 1
+ascendHeaderTitle.Text = "ASCEND"
+ascendHeaderTitle.Font = FONT
+ascendHeaderTitle.TextSize = 30
+ascendHeaderTitle.TextXAlignment = Enum.TextXAlignment.Left
+ascendHeaderTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+ascendHeaderTitle.TextStrokeTransparency = 0.6
+ascendHeaderTitle.ZIndex = 3
+ascendHeaderTitle.Parent = ascendHeader
+
+local ascendCloseButton = Instance.new("TextButton")
+ascendCloseButton.Name = "Close"
+ascendCloseButton.AnchorPoint = Vector2.new(1, 0.5)
+ascendCloseButton.Position = UDim2.new(1, -16, 0.5, 0)
+ascendCloseButton.Size = UDim2.fromOffset(40, 40)
+ascendCloseButton.BackgroundColor3 = Color3.fromRGB(235, 70, 70)
+ascendCloseButton.Text = "X"
+ascendCloseButton.Font = FONT
+ascendCloseButton.TextSize = 24
+ascendCloseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+ascendCloseButton.ZIndex = 3
+ascendCloseButton.AutoButtonColor = true
+ascendCloseButton.Parent = ascendHeader
+round(ascendCloseButton, 12)
+stroke(ascendCloseButton, Color3.fromRGB(150, 30, 30), 2)
+
+local ascendContent = Instance.new("Frame")
+ascendContent.Name = "Content"
+ascendContent.Size = UDim2.new(1, -32, 1, -96)
+ascendContent.Position = UDim2.fromOffset(16, 80)
+ascendContent.BackgroundColor3 = Color3.fromRGB(60, 50, 95)
+ascendContent.ZIndex = 1
+ascendContent.Parent = ascendMain
+round(ascendContent, 16)
+stroke(ascendContent, Color3.fromRGB(70, 130, 140), 2)
 
 -- Rank title (color-coded), big at the top of the panel.
 local ascRankLabel = Instance.new("TextLabel")
@@ -538,7 +761,7 @@ ascRankLabel.TextSize = 42
 ascRankLabel.TextStrokeTransparency = 0.6
 ascRankLabel.Text = "Seeker"
 ascRankLabel.ZIndex = 1
-ascRankLabel.Parent = ascendPanel
+ascRankLabel.Parent = ascendContent
 
 -- Ascension count.
 local ascCountLabel = Instance.new("TextLabel")
@@ -551,7 +774,7 @@ ascCountLabel.TextSize = 20
 ascCountLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
 ascCountLabel.Text = "Ascensions: 0"
 ascCountLabel.ZIndex = 1
-ascCountLabel.Parent = ascendPanel
+ascCountLabel.Parent = ascendContent
 
 -- Permanent multiplier reward.
 local ascMultLabel = Instance.new("TextLabel")
@@ -564,7 +787,7 @@ ascMultLabel.TextSize = 20
 ascMultLabel.TextColor3 = Color3.fromRGB(255, 200, 40)
 ascMultLabel.Text = "Permanent bonus: x1"
 ascMultLabel.ZIndex = 1
-ascMultLabel.Parent = ascendPanel
+ascMultLabel.Parent = ascendContent
 
 -- Requirement for the next Ascend.
 local ascReqLabel = Instance.new("TextLabel")
@@ -578,7 +801,7 @@ ascReqLabel.TextColor3 = Color3.fromRGB(210, 200, 230)
 ascReqLabel.TextWrapped = true
 ascReqLabel.Text = "Next Ascend needs 10,000 Spirit Power"
 ascReqLabel.ZIndex = 1
-ascReqLabel.Parent = ascendPanel
+ascReqLabel.Parent = ascendContent
 
 -- ASCEND button.
 local ascendButton = Instance.new("TextButton")
@@ -591,7 +814,7 @@ ascendButton.TextStrokeTransparency = 0.6
 ascendButton.AutoButtonColor = false
 ascendButton.Text = "ASCEND"
 ascendButton.ZIndex = 1
-ascendButton.Parent = ascendPanel
+ascendButton.Parent = ascendContent
 round(ascendButton, 14)
 stroke(ascendButton, Color3.fromRGB(150, 120, 30), 2)
 
@@ -657,10 +880,20 @@ spiritPowerValue.Changed:Connect(function()
 	renderAscend()
 end)
 
--- Refresh the Ascend panel whenever the shop opens, too.
-openShopEvent.OnClientEvent:Connect(refreshAscend)
+-- Open / close wiring for the standalone Ascend popup.
+local function openAscend()
+	refreshAscend() -- pull fresh state every time the pad is touched
+	PopupManager.open(ascendGui) -- closes any other open popup
+end
 
--- Initial draw.
+ascendCloseButton.Activated:Connect(function()
+	PopupManager.close(ascendGui)
+end)
+
+-- The server tells us to open this popup when the player touches the Ascend pad.
+openAscendEvent.OnClientEvent:Connect(openAscend)
+
+-- Initial draw (HUD rank + panel state), so the HUD is correct before first open.
 updateHudSpirit()
 refreshAscend()
 
@@ -800,3 +1033,309 @@ spiritPowerValue.Changed:Connect(renderSoulJar)
 -- Refresh whenever the shop opens, plus an initial draw.
 openShopEvent.OnClientEvent:Connect(refreshSoulJar)
 refreshSoulJar()
+
+--------------------------------------------------------------------------------
+-- Group Rewards popup (standalone — opened by the Group Rewards world pad)
+--------------------------------------------------------------------------------
+-- This is its OWN popup (not a shop tab). The Group Rewards pad in the world fires
+-- the OpenGroupRewards RemoteEvent, which shows this popup. The server remains the
+-- only authority on membership + whether the reward was already claimed; this UI
+-- just renders the state it returns and asks it to claim.
+
+local openGroupRewardsEvent = ReplicatedStorage:WaitForChild("OpenGroupRewards")
+local getGroupRewardStateFunc = ReplicatedStorage:WaitForChild("GetGroupRewardState")
+local claimGroupRewardFunc = ReplicatedStorage:WaitForChild("ClaimGroupReward")
+
+local GROUP_CLAIM_COLOR = Color3.fromRGB(70, 200, 90) -- green: ready to claim
+local GROUP_CHECK_COLOR = Color3.fromRGB(90, 170, 255) -- blue: join / re-check
+local GROUP_DONE_COLOR = Color3.fromRGB(255, 200, 40) -- gold: already claimed
+local GROUP_OFF_COLOR = Color3.fromRGB(110, 100, 140) -- muted: not configured
+
+-- Built once, hidden, and toggled — exactly like the shop popup. Re-touching the
+-- pad while it's open simply re-shows it (harmless).
+local groupGui = Instance.new("ScreenGui")
+groupGui.Name = "GroupRewardsGui"
+groupGui.ResetOnSpawn = false -- survive respawns
+groupGui.IgnoreGuiInset = true
+groupGui.Enabled = false -- hidden until the player touches the pad
+groupGui.Parent = playerGui
+PopupManager.register(groupGui)
+
+-- Soft drop shadow behind the popup.
+local groupShadow = Instance.new("Frame")
+groupShadow.Name = "Shadow"
+groupShadow.AnchorPoint = Vector2.new(0.5, 0.5)
+groupShadow.Position = UDim2.new(0.5, 0, 0.5, 6)
+groupShadow.Size = UDim2.fromOffset(540, 420)
+groupShadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+groupShadow.BackgroundTransparency = 0.6
+groupShadow.ZIndex = 0
+groupShadow.Parent = groupGui
+round(groupShadow, 22)
+
+-- Main popup frame (matches the shop's deep-violet + gold-outline styling).
+local groupMain = Instance.new("Frame")
+groupMain.Name = "Main"
+groupMain.AnchorPoint = Vector2.new(0.5, 0.5)
+groupMain.Position = UDim2.fromScale(0.5, 0.5)
+groupMain.Size = UDim2.fromOffset(520, 400)
+groupMain.BackgroundColor3 = Color3.fromRGB(45, 35, 70)
+groupMain.ZIndex = 1
+groupMain.Parent = groupGui
+round(groupMain, 20)
+stroke(groupMain, Color3.fromRGB(160, 90, 245), 3) -- purple outline (matches the pad)
+
+-- Header bar (purple to echo the monument).
+local groupHeader = Instance.new("Frame")
+groupHeader.Name = "Header"
+groupHeader.Size = UDim2.new(1, 0, 0, 64)
+groupHeader.BackgroundColor3 = Color3.fromRGB(120, 80, 200)
+groupHeader.ZIndex = 2
+groupHeader.Parent = groupMain
+round(groupHeader, 20)
+
+-- Cover the header's lower rounded corners so it blends into the body.
+local groupHeaderCover = Instance.new("Frame")
+groupHeaderCover.Size = UDim2.new(1, 0, 0, 24)
+groupHeaderCover.Position = UDim2.new(0, 0, 1, -24)
+groupHeaderCover.BackgroundColor3 = groupHeader.BackgroundColor3
+groupHeaderCover.BorderSizePixel = 0
+groupHeaderCover.ZIndex = 2
+groupHeaderCover.Parent = groupHeader
+
+local groupHeaderTitle = Instance.new("TextLabel")
+groupHeaderTitle.Size = UDim2.new(1, -80, 1, 0)
+groupHeaderTitle.Position = UDim2.fromOffset(20, 0)
+groupHeaderTitle.BackgroundTransparency = 1
+groupHeaderTitle.Text = "GROUP REWARDS"
+groupHeaderTitle.Font = FONT
+groupHeaderTitle.TextSize = 30
+groupHeaderTitle.TextXAlignment = Enum.TextXAlignment.Left
+groupHeaderTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+groupHeaderTitle.TextStrokeTransparency = 0.6
+groupHeaderTitle.ZIndex = 3
+groupHeaderTitle.Parent = groupHeader
+
+-- Close ("X") button.
+local groupCloseButton = Instance.new("TextButton")
+groupCloseButton.Name = "Close"
+groupCloseButton.AnchorPoint = Vector2.new(1, 0.5)
+groupCloseButton.Position = UDim2.new(1, -16, 0.5, 0)
+groupCloseButton.Size = UDim2.fromOffset(40, 40)
+groupCloseButton.BackgroundColor3 = Color3.fromRGB(235, 70, 70)
+groupCloseButton.Text = "X"
+groupCloseButton.Font = FONT
+groupCloseButton.TextSize = 24
+groupCloseButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+groupCloseButton.ZIndex = 3
+groupCloseButton.AutoButtonColor = true
+groupCloseButton.Parent = groupHeader
+round(groupCloseButton, 12)
+stroke(groupCloseButton, Color3.fromRGB(150, 30, 30), 2)
+
+-- Body area below the header, where the reward content lives.
+local groupContent = Instance.new("Frame")
+groupContent.Name = "Content"
+groupContent.Size = UDim2.new(1, -32, 1, -96)
+groupContent.Position = UDim2.fromOffset(16, 80)
+groupContent.BackgroundColor3 = Color3.fromRGB(60, 50, 95)
+groupContent.ZIndex = 1
+groupContent.Parent = groupMain
+round(groupContent, 16)
+stroke(groupContent, Color3.fromRGB(120, 90, 170), 2)
+
+-- Small heading above the reward list.
+local groupBundleHeading = Instance.new("TextLabel")
+groupBundleHeading.AnchorPoint = Vector2.new(0.5, 0)
+groupBundleHeading.Position = UDim2.new(0.5, 0, 0, 10)
+groupBundleHeading.Size = UDim2.new(1, -32, 0, 32)
+groupBundleHeading.BackgroundTransparency = 1
+groupBundleHeading.Font = FONT
+groupBundleHeading.TextSize = 24
+groupBundleHeading.TextColor3 = Color3.fromRGB(255, 200, 40)
+groupBundleHeading.TextStrokeTransparency = 0.6
+groupBundleHeading.Text = "Reward Bundle"
+groupBundleHeading.ZIndex = 1
+groupBundleHeading.Parent = groupContent
+
+-- The reward bundle, listed (built from the server's reward summary).
+local groupRewards = Instance.new("TextLabel")
+groupRewards.AnchorPoint = Vector2.new(0.5, 0)
+groupRewards.Position = UDim2.new(0.5, 0, 0, 46)
+groupRewards.Size = UDim2.new(1, -36, 0, 96)
+groupRewards.BackgroundTransparency = 1
+groupRewards.Font = FONT
+groupRewards.TextSize = 18
+groupRewards.TextYAlignment = Enum.TextYAlignment.Top
+groupRewards.TextColor3 = Color3.fromRGB(235, 230, 245)
+groupRewards.TextWrapped = true
+groupRewards.Text = ""
+groupRewards.ZIndex = 1
+groupRewards.Parent = groupContent
+
+-- Small hint shown only when the player isn't in the group yet.
+local groupHint = Instance.new("TextLabel")
+groupHint.Name = "Hint"
+groupHint.AnchorPoint = Vector2.new(0.5, 1)
+groupHint.Position = UDim2.new(0.5, 0, 1, -128)
+groupHint.Size = UDim2.new(1, -36, 0, 32)
+groupHint.BackgroundTransparency = 1
+groupHint.Font = FONT
+groupHint.TextSize = 14
+groupHint.TextColor3 = Color3.fromRGB(180, 175, 200)
+groupHint.TextWrapped = true
+groupHint.Visible = false
+groupHint.Text = "Already joined? You may need to rejoin the game for it to register."
+groupHint.ZIndex = 1
+groupHint.Parent = groupContent
+
+-- Status / instructions line.
+local groupStatus = Instance.new("TextLabel")
+groupStatus.AnchorPoint = Vector2.new(0.5, 1)
+groupStatus.Position = UDim2.new(0.5, 0, 1, -80)
+groupStatus.Size = UDim2.new(1, -36, 0, 44)
+groupStatus.BackgroundTransparency = 1
+groupStatus.Font = FONT
+groupStatus.TextSize = 16
+groupStatus.TextColor3 = Color3.fromRGB(210, 200, 230)
+groupStatus.TextWrapped = true
+groupStatus.Text = ""
+groupStatus.ZIndex = 1
+groupStatus.Parent = groupContent
+
+-- Adaptive action button (claim / re-check / claimed / coming soon).
+local groupButton = Instance.new("TextButton")
+groupButton.AnchorPoint = Vector2.new(0.5, 1)
+groupButton.Position = UDim2.new(0.5, 0, 1, -16)
+groupButton.Size = UDim2.new(1, -40, 0, 56)
+groupButton.Font = FONT
+groupButton.TextSize = 22
+groupButton.TextStrokeTransparency = 0.6
+groupButton.AutoButtonColor = false
+groupButton.Text = "CLAIM"
+groupButton.ZIndex = 1
+groupButton.Parent = groupContent
+round(groupButton, 14)
+stroke(groupButton, Color3.fromRGB(40, 120, 55), 2)
+
+-- Latest authoritative group-reward state from the server.
+local groupData = {
+	configured = false,
+	groupId = 0,
+	inGroup = false,
+	claimed = false,
+	reward = { autoClicker = true, spiritPower = 0, zenLevels = 0 },
+}
+
+-- Build the bundle list from whatever rewards the server reports.
+local function describeRewards(reward)
+	local lines = {}
+	if reward.autoClicker then
+		table.insert(lines, "• Permanent Auto-Clicker")
+	end
+	if reward.spiritPower and reward.spiritPower > 0 then
+		table.insert(lines, "• " .. commafy(reward.spiritPower) .. " Spirit Power")
+	end
+	if reward.zenLevels and reward.zenLevels > 0 then
+		local plural = reward.zenLevels == 1 and " Zen Level" or " Zen Levels"
+		table.insert(lines, "• +" .. reward.zenLevels .. plural)
+	end
+	return table.concat(lines, "\n")
+end
+
+-- Render one of the three real states: not-in-group, in-group (redeemable), or
+-- already-claimed. (No "coming soon" — that placeholder is gone.)
+local function renderGroup()
+	groupRewards.Text = describeRewards(groupData.reward)
+
+	if groupData.claimed then
+		-- (c) Already claimed: show the claimed state, no button.
+		groupHint.Visible = false
+		groupStatus.Text = "Claimed! Your auto-clicker is active. Thanks for joining \u{2764}"
+		groupButton.Visible = false
+	elseif groupData.inGroup then
+		-- (b) Member, not claimed: green redeem button.
+		groupHint.Visible = false
+		groupStatus.Text = "You're a member \u{2014} redeem your reward bundle!"
+		groupButton.Visible = true
+		groupButton.Text = "REDEEM REWARDS"
+		groupButton.BackgroundColor3 = GROUP_CLAIM_COLOR
+		groupButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+		groupButton.AutoButtonColor = true
+		groupButton.Active = true
+	else
+		-- (a) Not in group: join button + the "already joined?" rejoin hint.
+		groupHint.Visible = true
+		groupStatus.Text = "Join our Roblox group to unlock the reward bundle!"
+		groupButton.Visible = true
+		groupButton.Text = "JOIN GROUP"
+		groupButton.BackgroundColor3 = GROUP_CHECK_COLOR
+		groupButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+		groupButton.AutoButtonColor = true
+		groupButton.Active = true
+	end
+end
+
+-- Ask the server for the latest group-reward state, then redraw.
+local function refreshGroup()
+	groupData = getGroupRewardStateFunc:InvokeServer()
+	renderGroup()
+end
+
+-- Trigger Roblox's group-join flow. NOTE: Roblox has no guaranteed in-experience
+-- "join group" prompt API, so we open the group's web page (GuiService is gated on
+-- some clients, hence pcall) and re-check membership shortly after. The on-screen
+-- hint reminds the player they may need to rejoin for membership to register.
+local function attemptJoinGroup()
+	local url = "https://www.roblox.com/groups/" .. tostring(groupData.groupId)
+	local opened = pcall(function()
+		GuiService:OpenBrowserWindow(url)
+	end)
+	if not opened then
+		groupStatus.Text = "Find our group (#" .. tostring(groupData.groupId)
+			.. ") in the Roblox app, join, then come back."
+	end
+	-- Re-check membership a moment later (covers the no-rejoin-needed case).
+	task.delay(2, refreshGroup)
+end
+
+-- Button: redeem if a member, otherwise start the join flow.
+groupButton.Activated:Connect(function()
+	if not groupButton.Active then
+		return
+	end
+
+	if groupData.claimed then
+		return -- nothing to do; button is hidden anyway
+	elseif groupData.inGroup then
+		-- Redeem: the server RE-VERIFIES membership + not-already-claimed, grants the
+		-- bundle, and returns { ok, message, state }.
+		local result = claimGroupRewardFunc:InvokeServer()
+		groupData = result.state
+		renderGroup()
+		groupStatus.Text = result.message
+		if result.ok then
+			-- The claim may have granted a Zen level (Spirit Power changes are picked
+			-- up by the .Changed handler). Refresh the Zen panel to match.
+			refreshZen()
+		end
+	else
+		attemptJoinGroup()
+	end
+end)
+
+-- Open / close wiring (re-checks membership every open, as required).
+local function openGroupRewards()
+	refreshGroup() -- pull fresh state (incl. membership) every time the pad is touched
+	PopupManager.open(groupGui) -- closes any other open popup
+end
+
+groupCloseButton.Activated:Connect(function()
+	PopupManager.close(groupGui)
+end)
+
+-- The server tells us to open this popup when the player touches the Group pad.
+openGroupRewardsEvent.OnClientEvent:Connect(openGroupRewards)
+
+-- Prime the state once at startup so the first open is instant.
+refreshGroup()
