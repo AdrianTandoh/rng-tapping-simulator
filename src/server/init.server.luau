@@ -51,6 +51,12 @@ local GROUP_REWARD = {
 local AUTO_CLICK_BASE_AMOUNT = 1 -- base Spirit Power per auto-click, BEFORE the Zen multiplier
 local AUTO_CLICK_INTERVAL = 1 -- seconds between auto-clicks (1 = one per second)
 
+-- Meditation Altar conversion tuning.
+-- Starter rate: 0.3 means 1000 Spirit Power -> 300 Chi (deliberately stingy; later
+-- worlds raise this). Keep as a single value for now so it's easy to swap to a
+-- per-world lookup when the worlds feature is built.
+local CONVERSION_RATE = 0.3
+
 --------------------------------------------------------------------------------
 -- 1. RemoteEvents
 --------------------------------------------------------------------------------
@@ -122,6 +128,18 @@ getGroupRewardStateFunc.Parent = ReplicatedStorage
 local claimGroupRewardFunc = Instance.new("RemoteFunction")
 claimGroupRewardFunc.Name = "ClaimGroupReward"
 claimGroupRewardFunc.Parent = ReplicatedStorage
+
+-- Fired by the server when a player touches the Meditation Altar pad, telling that
+-- client to request a conversion (the actual convert is the RemoteFunction below).
+local altarTouchedEvent = Instance.new("RemoteEvent")
+altarTouchedEvent.Name = "AltarTouched"
+altarTouchedEvent.Parent = ReplicatedStorage
+
+-- Client invokes this to convert ALL its Spirit Power into Chi. The SERVER does all
+-- the work and returns { ok, converted, message } for client-side feedback.
+local convertSpiritToChiFunc = Instance.new("RemoteFunction")
+convertSpiritToChiFunc.Name = "ConvertSpiritToChi"
+convertSpiritToChiFunc.Parent = ReplicatedStorage
 
 --------------------------------------------------------------------------------
 -- 2. Player progression tables
@@ -653,6 +671,35 @@ claimGroupRewardFunc.OnServerInvoke = function(player)
 end
 
 --------------------------------------------------------------------------------
+-- 3f. Meditation Altar — convert Spirit Power into Chi (server-authoritative)
+--------------------------------------------------------------------------------
+-- "Convert ALL at once": reads the player's Spirit Power, floors SP * CONVERSION_RATE
+-- into Chi, grants that Chi through the Slice-1 grantChi chokepoint, then empties the
+-- jar. The graceful case (chiGained <= 0) — which happens at 0 Spirit Power OR when
+-- the amount is so small the rate floors to 0 — changes NOTHING and tells the client
+-- there's nothing to convert. Returns { ok, converted, message } for client feedback.
+convertSpiritToChiFunc.OnServerInvoke = function(player)
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
+	if not spiritPower then
+		return { ok = false, converted = 0, message = "Meditate to gather more Spirit Power first!" }
+	end
+
+	local chiGained = math.floor(spiritPower.Value * CONVERSION_RATE)
+	if chiGained <= 0 then
+		-- Nothing worth converting: leave Spirit Power AND Chi untouched.
+		return { ok = false, converted = 0, message = "Meditate to gather more Spirit Power first!" }
+	end
+
+	-- Grant first (through the single Chi chokepoint), then empty the jar. Both writes
+	-- are to already-persisted live values, so no extra save wiring is needed.
+	grantChi(player, chiGained)
+	spiritPower.Value = 0
+
+	return { ok = true, converted = chiGained, message = "+" .. chiGained .. " Chi!" }
+end
+
+--------------------------------------------------------------------------------
 -- 4. Click-to-earn with a simple rate limit
 --------------------------------------------------------------------------------
 -- Basic anti-exploit protection: a client could be hacked to fire the RemoteEvent
@@ -878,6 +925,25 @@ createMonumentPad({
 	strokeColor = Color3.fromRGB(60, 25, 110),
 	onTouched = function(plr)
 		openGroupRewardsEvent:FireClient(plr)
+	end,
+})
+
+-- MEDITATION ALTAR (jade/green) — converts Spirit Power into Chi. Placed across the
+-- plaza on the opposite (-Z) side from the row of three pads so nothing overlaps, and
+-- given a distinct jade glow to read as the special "sell" station. Touching it tells
+-- the client to request a conversion (all the conversion logic lives in section 3f).
+createMonumentPad({
+	name = "MeditationAltarPad",
+	position = Vector3.new(0, 0, -24),
+	discColor = Color3.fromRGB(60, 220, 130),
+	glowColor = Color3.fromRGB(95, 240, 155),
+	pedestalColor = Color3.fromRGB(26, 58, 42),
+	title = "MEDITATION ALTAR",
+	subtitle = "Convert Spirit Power into Chi",
+	titleColor = Color3.fromRGB(175, 255, 210),
+	strokeColor = Color3.fromRGB(18, 78, 48),
+	onTouched = function(plr)
+		altarTouchedEvent:FireClient(plr)
 	end,
 })
 
