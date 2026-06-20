@@ -393,7 +393,7 @@ local function renderZen(state)
 		buyButton.AutoButtonColor = false
 		buyButton.Active = false -- unbuyable at the cap
 	else
-		buyButton.Text = "BUY  •  " .. state.cost .. " Spirit Power"
+		buyButton.Text = "BUY  •  " .. state.cost .. " Chi"
 		buyButton.BackgroundColor3 = BUY_COLOR
 		buyButton.AutoButtonColor = true
 		buyButton.Active = true
@@ -799,7 +799,7 @@ ascReqLabel.Font = FONT
 ascReqLabel.TextSize = 16
 ascReqLabel.TextColor3 = Color3.fromRGB(210, 200, 230)
 ascReqLabel.TextWrapped = true
-ascReqLabel.Text = "Next Ascend needs 10,000 Spirit Power"
+ascReqLabel.Text = "Next Ascend needs 10,000 Chi"
 ascReqLabel.ZIndex = 1
 ascReqLabel.Parent = ascendContent
 
@@ -827,11 +827,11 @@ local function renderAscend()
 	ascRankLabel.TextColor3 = getRankColor(count)
 	ascCountLabel.Text = "Ascensions: " .. count
 	ascMultLabel.Text = "Permanent bonus: " .. fmtMult(ascendData.multiplier)
-	ascReqLabel.Text = "Next Ascend needs " .. commafy(ascendData.requirement) .. " Spirit Power"
+	ascReqLabel.Text = "Next Ascend needs " .. commafy(ascendData.requirement) .. " Chi"
 
 	-- Button is enabled only when the player meets the requirement (checked live
-	-- against the Spirit Power value); otherwise it shows locked + the cost.
-	local ready = spiritPowerValue.Value >= ascendData.requirement
+	-- against the CHI value now); otherwise it shows locked + the cost.
+	local ready = chiValue.Value >= ascendData.requirement
 	if ready then
 		ascendButton.Text = "ASCEND"
 		ascendButton.BackgroundColor3 = ASCEND_READY_COLOR
@@ -839,7 +839,7 @@ local function renderAscend()
 		ascendButton.AutoButtonColor = true
 		ascendButton.Active = true
 	else
-		ascendButton.Text = "LOCKED  •  need " .. commafy(ascendData.requirement)
+		ascendButton.Text = "LOCKED  •  need " .. commafy(ascendData.requirement) .. " Chi"
 		ascendButton.BackgroundColor3 = ASCEND_LOCKED_COLOR
 		ascendButton.TextColor3 = Color3.fromRGB(225, 220, 235)
 		ascendButton.AutoButtonColor = false
@@ -865,20 +865,21 @@ ascendButton.Activated:Connect(function()
 	renderAscend()
 	updateHudRank(ascendData.count)
 	refreshZen()
-	-- The server reset Spirit Power to 0, which fires the .Changed handler below
-	-- and updates the HUD counter automatically.
+	-- The server reset Chi to 0 (and zeroed the Spirit Power bar for a clean slate),
+	-- which fires their .Changed handlers and updates both HUD readouts automatically.
 end)
 
 --------------------------------------------------------------------------------
 -- Live wiring
 --------------------------------------------------------------------------------
 
--- Spirit Power changing updates the HUD counter and re-evaluates whether the
--- ASCEND button should now be unlocked.
-spiritPowerValue.Changed:Connect(function()
-	updateHudSpirit()
-	renderAscend()
-end)
+-- Spirit Power changing only affects the HUD vessel bar now — Spirit Power no longer
+-- gates any purchase (it's earned and converted at the altar, not spent).
+spiritPowerValue.Changed:Connect(updateHudSpirit)
+
+-- CHI is the purchase currency now, so Chi changing re-evaluates whether the player
+-- can afford to ASCEND. (The Chi HUD counter is wired separately near the HUD build.)
+chiValue.Changed:Connect(renderAscend)
 
 -- Open / close wiring for the standalone Ascend popup.
 local function openAscend()
@@ -994,9 +995,10 @@ local function renderSoulJar()
 	jarNextLabel.Text = "Next: " .. soulJarData.nextName
 		.. "  (holds " .. commafy(soulJarData.nextCapacity) .. ")"
 
-	-- Enabled only when affordable (checked live against Spirit Power).
-	local affordable = spiritPowerValue.Value >= soulJarData.nextCost
-	buyJarButton.Text = "BUY  •  " .. commafy(soulJarData.nextCost) .. " Spirit Power"
+	-- Enabled only when affordable (checked live against CHI now — the upgrade cost is
+	-- Chi). The jar still HOLDS Spirit Power (see jarCapLabel above); only cost changed.
+	local affordable = chiValue.Value >= soulJarData.nextCost
+	buyJarButton.Text = "BUY  •  " .. commafy(soulJarData.nextCost) .. " Chi"
 	if affordable then
 		buyJarButton.BackgroundColor3 = JAR_BUY_COLOR
 		buyJarButton.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -1026,9 +1028,9 @@ buyJarButton.Activated:Connect(function()
 	renderSoulJar()
 end)
 
--- Spirit Power changing re-evaluates whether the BUY button is affordable (and
--- updates the HUD "held / cap" readout via renderSoulJar -> updateHudSpirit).
-spiritPowerValue.Changed:Connect(renderSoulJar)
+-- CHI changing re-evaluates whether the Soul Jar BUY button is affordable (the cost
+-- is Chi now). The HUD vessel bar itself is updated by the Spirit Power handler above.
+chiValue.Changed:Connect(renderSoulJar)
 
 -- Refresh whenever the shop opens, plus an initial draw.
 openShopEvent.OnClientEvent:Connect(refreshSoulJar)

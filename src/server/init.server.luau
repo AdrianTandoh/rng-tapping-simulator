@@ -51,11 +51,55 @@ local GROUP_REWARD = {
 local AUTO_CLICK_BASE_AMOUNT = 1 -- base Spirit Power per auto-click, BEFORE the Zen multiplier
 local AUTO_CLICK_INTERVAL = 1 -- seconds between auto-clicks (1 = one per second)
 
--- Meditation Altar conversion tuning.
--- Starter rate: 0.3 means 1000 Spirit Power -> 300 Chi (deliberately stingy; later
--- worlds raise this). Keep as a single value for now so it's easy to swap to a
--- per-world lookup when the worlds feature is built.
-local CONVERSION_RATE = 0.3
+--------------------------------------------------------------------------------
+-- 0c. WORLDS CONFIG — the heart of the multi-world system (edit / add freely)
+--------------------------------------------------------------------------------
+-- One place, multiple "worlds" (areas), NOT separate places/teleports. This is the
+-- single source of truth for every world's tuning. To add a 4th world, just append
+-- a new {} entry below — nothing else in this slice needs to change.
+--
+-- Each world has:
+--   name                    : display name (spirit-themed).
+--   conversionRate          : Meditation Altar rate. floor(SpiritPower * conversionRate)
+--                             Chi per convert. Starter is deliberately stingy (0.3).
+--   jarCapMultiplier        : multiplier applied to Soul Jar capacities while in this
+--                             world (scales the SP storage cap per world). DEFINED NOW
+--                             but NOT yet applied to gameplay — wired in a later slice.
+--   clickMultiplier         : extra click-earn multiplier while in this world. DEFINED
+--                             NOW but NOT yet applied to gameplay — wired in a later slice.
+--   unlockChiCost           : Chi needed to unlock this world (starter is free = 0).
+--   unlockAscendRequirement : minimum AscendCount allowed to unlock (starter = 0).
+--
+-- World 1 is the free, default starter that every player owns. Indices are the save
+-- representation (currentWorld = an index; unlockedWorlds = a set/array of indices).
+local WORLDS = {
+	[1] = {
+		name = "Tranquil Grove",
+		conversionRate = 0.3,
+		jarCapMultiplier = 1, -- scales Soul Jar cap in this world (later slice)
+		clickMultiplier = 1, -- extra click-earn multiplier in this world (later slice)
+		unlockChiCost = 0, -- free: the default starter world
+		unlockAscendRequirement = 0,
+	},
+	[2] = {
+		name = "Whispering Highlands",
+		conversionRate = 0.6,
+		jarCapMultiplier = 3, -- scales Soul Jar cap in this world (later slice)
+		clickMultiplier = 2, -- extra click-earn multiplier in this world (later slice)
+		unlockChiCost = 5000,
+		unlockAscendRequirement = 1,
+	},
+	[3] = {
+		name = "Celestial Summit",
+		conversionRate = 1.0,
+		jarCapMultiplier = 10, -- scales Soul Jar cap in this world (later slice)
+		clickMultiplier = 5, -- extra click-earn multiplier in this world (later slice)
+		unlockChiCost = 50000,
+		unlockAscendRequirement = 3,
+	},
+}
+
+local DEFAULT_WORLD = 1 -- index every player starts in / owns by default
 
 --------------------------------------------------------------------------------
 -- 1. RemoteEvents
@@ -150,6 +194,10 @@ local zenLevel = {} -- [player] = Zen level (starts at 0)
 local ascendCount = {} -- [player] = times Ascended (starts at 0)
 local jarTier = {} -- [player] = Soul Jar tier index (0 = Clay, starts at 0)
 local canSave = {} -- [player] = true ONLY if their data loaded cleanly (see 2c)
+-- [player] = true once setup has STARTED for them. Set SYNCHRONOUSLY (before the
+-- yielding DataStore load) so a player can NEVER be set up twice — this is what stops
+-- duplicate leaderstats / Spirit Power / Chi objects, the root of the Chi desync.
+local initialized = {}
 -- Set of players who own the permanent auto-clicker. A player is present (value
 -- true) ONLY if they own it; missing = does not own it (defaults to false). This
 -- drives the auto-clicker loop.
@@ -158,6 +206,18 @@ local hasAutoClicker = {}
 -- is the dedicated one-time-claim gate (separate from hasAutoClicker so the bundle
 -- contents can change freely). Missing = not yet claimed (defaults to false).
 local claimedGroupReward = {}
+-- Per-player WORLD state (server-authoritative, persisted). currentWorld[player] is
+-- the index of the world they're currently in (default DEFAULT_WORLD). unlockedWorlds
+-- [player] is a SET of unlocked indices ({ [1] = true, ... }); it always contains the
+-- starter world. These are seeded from saved data in setupLeaderstats.
+local currentWorld = {} -- [player] = world index (default 1)
+local unlockedWorlds = {} -- [player] = { [index] = true } set of unlocked worlds
+
+-- The config row for the world a player is currently in. Falls back to the starter
+-- world if the stored index is ever missing/invalid, so callers always get a world.
+local function getCurrentWorld(player)
+	return WORLDS[currentWorld[player] or DEFAULT_WORLD] or WORLDS[DEFAULT_WORLD]
+end
 
 --------------------------------------------------------------------------------
 -- 2b. Soul Jar (storage cap) configuration
@@ -166,10 +226,11 @@ local claimedGroupReward = {}
 -- list (index 1 = tier 0 = Clay, the default). `upgradeCost` is the price to buy
 -- THIS tier from the previous one (Clay is free / owned by default).
 --
--- PRICING NOTE: the design hint suggested "~half the next tier's capacity", but
--- since Spirit Power is hard-clamped to the CURRENT jar, a price above the
--- current capacity could never be afforded. So each upgrade instead costs the
--- current jar's full capacity (fill it, then upgrade) — always reachable. Edit
+-- PRICING NOTE: upgrade costs are now paid in CHI (the uncapped spendable bank), not
+-- Spirit Power, so they're no longer bounded by the current jar's capacity. The
+-- numbers are unchanged from when they were Spirit-Power-priced (each upgrade costs
+-- the previous jar's full capacity) and will be retuned in a later pass. The jar
+-- still CAPS Spirit Power (getSpiritCap) — only the upgrade cost is Chi now. Edit
 -- these numbers freely.
 local SOUL_JAR_TIERS = {
 	{ name = "Clay Jar", capacity = 1000, upgradeCost = 0 }, -- starting tier (owned)
@@ -216,6 +277,10 @@ local function makeDefaults()
 		HasAutoClicker = false,
 		ClaimedGroupReward = false,
 		Chi = 0, -- second, spendable currency (no cap); starts at 0 for new players
+		-- World state. CurrentWorld is an index; UnlockedWorlds is a SET (the in-memory
+		-- form: { [index] = true }). New players start in / own only the starter world.
+		CurrentWorld = DEFAULT_WORLD,
+		UnlockedWorlds = { [DEFAULT_WORLD] = true },
 	}
 end
 
@@ -239,6 +304,26 @@ local function loadPlayerData(player)
 		return makeDefaults(), true -- brand-new player
 	end
 
+	-- World state, read defensively like everything else. A player saved before worlds
+	-- existed has neither field, so they default to currentWorld=1 / unlockedWorlds={1},
+	-- exactly as required.
+	--   * CurrentWorld: must be a valid world index, else snap back to the starter.
+	--   * UnlockedWorlds: saved as an ARRAY of indices; rebuild into a SET, keeping only
+	--     valid indices and ALWAYS including the starter world (never lockable).
+	local savedCurrent = tonumber(result.CurrentWorld) or DEFAULT_WORLD
+	if WORLDS[savedCurrent] == nil then
+		savedCurrent = DEFAULT_WORLD
+	end
+	local savedUnlocked = { [DEFAULT_WORLD] = true }
+	if type(result.UnlockedWorlds) == "table" then
+		for _, idx in ipairs(result.UnlockedWorlds) do
+			local n = tonumber(idx)
+			if n and WORLDS[n] ~= nil then
+				savedUnlocked[n] = true
+			end
+		end
+	end
+
 	-- Existing data: read each field defensively. A player saved before these flags
 	-- existed simply has no such field, which reads as false (default for existing
 	-- players, exactly as required).
@@ -252,6 +337,8 @@ local function loadPlayerData(player)
 		-- Read defensively like the others: a player saved before Chi existed has no
 		-- such field, which reads as 0 (the new-player default), exactly as required.
 		Chi = tonumber(result.Chi) or 0,
+		CurrentWorld = savedCurrent,
+		UnlockedWorlds = savedUnlocked, -- SET form (in-memory); serialized as array on save
 	}, true
 end
 
@@ -269,6 +356,12 @@ local function savePlayerData(player)
 	-- Chi lives in its own replicated IntValue on the Player (see setupLeaderstats);
 	-- read it the same way Spirit Power is read, defaulting to 0 if absent.
 	local chi = player:FindFirstChild("Chi")
+	-- Serialize unlockedWorlds (a SET in memory) into a plain ARRAY of indices, which
+	-- DataStore stores cleanly. Always guaranteed to include the starter world.
+	local unlockedArray = {}
+	for idx in pairs(unlockedWorlds[player] or { [DEFAULT_WORLD] = true }) do
+		table.insert(unlockedArray, idx)
+	end
 	local data = {
 		SpiritPower = spiritPower and spiritPower.Value or 0,
 		ZenLevel = zenLevel[player] or 0,
@@ -277,6 +370,8 @@ local function savePlayerData(player)
 		HasAutoClicker = hasAutoClicker[player] == true,
 		ClaimedGroupReward = claimedGroupReward[player] == true,
 		Chi = chi and chi.Value or 0,
+		CurrentWorld = currentWorld[player] or DEFAULT_WORLD,
+		UnlockedWorlds = unlockedArray,
 	}
 
 	local attempt = 0
@@ -306,6 +401,19 @@ end
 --------------------------------------------------------------------------------
 -- Roblox shows any IntValue inside a "leaderstats" folder on the leaderboard.
 local function setupLeaderstats(player)
+	-- SINGLE-SOURCE-OF-TRUTH GUARD — this is the Chi-desync fix. setupLeaderstats can be
+	-- invoked more than once for the same player: Players.PlayerAdded AND the GetPlayers()
+	-- loop below can both fire for someone who joins in that window, and a live-sync reload
+	-- re-runs it too. Every run USED to unconditionally Instance.new a fresh leaderstats +
+	-- Spirit Power + Chi, leaving the player with DUPLICATE currency objects — the client
+	-- cached one Chi (WaitForChild) while the server's FindFirstChild resolved the other, so
+	-- the HUD and spendChi drifted apart. We set this flag SYNCHRONOUSLY, before the yielding
+	-- load below, so only the first invocation proceeds (no double-load, no race).
+	if initialized[player] then
+		return
+	end
+	initialized[player] = true
+
 	-- Load first so everything is seeded from saved progress (or defaults).
 	local data, loadOk = loadPlayerData(player)
 	canSave[player] = loadOk -- only allow saving if the load was clean
@@ -320,26 +428,43 @@ local function setupLeaderstats(player)
 	if data.ClaimedGroupReward then
 		claimedGroupReward[player] = true
 	end
+	-- Seed world state. data.CurrentWorld is a sanitized index and data.UnlockedWorlds
+	-- is already a SET (built by loadPlayerData / makeDefaults), so assign directly.
+	currentWorld[player] = data.CurrentWorld
+	unlockedWorlds[player] = data.UnlockedWorlds
 
-	local leaderstats = Instance.new("Folder")
-	leaderstats.Name = "leaderstats"
+	-- FIND-OR-CREATE every replicated value (never a blind Instance.new). Combined with the
+	-- guard above this guarantees exactly ONE leaderstats / Spirit Power / Chi per player,
+	-- even across a live-sync reload where the instances persisted from a previous run (we
+	-- reuse the existing object, so the client's cached reference stays valid). The single
+	-- Chi IntValue is THE source of truth: grantChi, spendChi, the altar, the HUD and the
+	-- save all read/write this exact object.
+	local leaderstats = player:FindFirstChild("leaderstats")
+	if not leaderstats then
+		leaderstats = Instance.new("Folder")
+		leaderstats.Name = "leaderstats"
+		leaderstats.Parent = player
+	end
 
-	local spiritPower = Instance.new("IntValue")
-	spiritPower.Name = "Spirit Power"
+	local spiritPower = leaderstats:FindFirstChild("Spirit Power")
+	if not spiritPower then
+		spiritPower = Instance.new("IntValue")
+		spiritPower.Name = "Spirit Power"
+		spiritPower.Parent = leaderstats
+	end
 	-- Clamp to the (now-known) jar capacity in case saved data somehow exceeds it.
 	spiritPower.Value = math.min(data.SpiritPower, getSpiritCap(player))
-	spiritPower.Parent = leaderstats
 
-	leaderstats.Parent = player
-
-	-- Chi: the second, spendable currency. It lives in its OWN replicated IntValue
-	-- parented directly to the Player (deliberately NOT inside leaderstats, so it
-	-- doesn't appear on the Roblox leaderboard) that the client watches read-only —
-	-- mirroring how Spirit Power is exposed. Unlike Spirit Power it has no cap.
-	local chi = Instance.new("IntValue")
-	chi.Name = "Chi"
+	-- Chi: the second, spendable currency. Its OWN replicated IntValue parented directly to
+	-- the Player (deliberately NOT inside leaderstats, so it stays off the Roblox leaderboard)
+	-- that the client watches read-only. Unlike Spirit Power it has no cap.
+	local chi = player:FindFirstChild("Chi")
+	if not chi then
+		chi = Instance.new("IntValue")
+		chi.Name = "Chi"
+		chi.Parent = player
+	end
 	chi.Value = data.Chi
-	chi.Parent = player
 end
 
 -- Handle players who join after this script runs...
@@ -354,7 +479,7 @@ end
 -- 3. Ascend rewards + the single chokepoint for granting Spirit Power
 --------------------------------------------------------------------------------
 -- Ascend (prestige) tuning values — all grouped here so they're easy to tweak.
-local ASCEND_BASE_REQUIREMENT = 10000 -- Spirit Power needed for the 1st Ascend
+local ASCEND_BASE_REQUIREMENT = 10000 -- Chi needed for the 1st Ascend (same number, now Chi)
 local ASCEND_REQUIREMENT_SCALE = 5 -- each Ascend multiplies the requirement by this
 local ASCEND_CAP_INCREASE = 2 -- each Ascend raises the Zen level cap by this much
 local ASCEND_MULTIPLIER_PER = 1.5 -- permanent Spirit Power multiplier gained per Ascend
@@ -403,8 +528,8 @@ local function grantChi(player, amount)
 end
 
 -- Deduct Chi for a purchase. Returns true and deducts ONLY if the player can fully
--- afford `amount`; otherwise returns false and changes nothing. Unused this slice
--- (Chi is currently unspendable), but defined now so every future sink routes here.
+-- afford `amount`; otherwise returns false and changes nothing. This is the shared
+-- affordability+deduction chokepoint for ALL Chi sinks (Zen, Soul Jar, Ascend).
 local function spendChi(player, amount)
 	amount = math.floor(amount)
 	if amount <= 0 then
@@ -427,7 +552,7 @@ end
 -- The cap is computed per player (getZenCap) from a base value plus the Ascend
 -- bonus, so the buy logic never hardcodes the limit.
 local ZEN_BASE_CAP = 8 -- base max Zen level (x256); each Ascend raises it by ASCEND_CAP_INCREASE
-local ZEN_BASE_PRICE = 50 -- Spirit Power cost of the first level (0 -> 1)
+local ZEN_BASE_PRICE = 50 -- Chi cost of the first level (0 -> 1); same number, now Chi
 local ZEN_PRICE_MULTIPLIER = 2.5 -- each level costs 2.5x the previous one
 
 -- (zenLevel table is declared earlier, near the leaderstats setup.)
@@ -468,7 +593,7 @@ getZenStateFunc.OnServerInvoke = function(player)
 	return getZenState(player)
 end
 
--- Purchase handler — fully validated on the server.
+-- Purchase handler — fully validated on the server. Cost is now paid in CHI.
 buyZenFunc.OnServerInvoke = function(player)
 	local level = zenLevel[player] or 0
 
@@ -477,16 +602,14 @@ buyZenFunc.OnServerInvoke = function(player)
 		return getZenState(player) -- unchanged
 	end
 
-	-- Reject if the player can't afford the next level.
+	-- Charge the Chi cost through the spendChi chokepoint, which BOTH checks the
+	-- player can afford it and deducts it atomically. If they can't, nothing changes.
 	local cost = getZenCost(level)
-	local leaderstats = player:FindFirstChild("leaderstats")
-	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
-	if not spiritPower or spiritPower.Value < cost then
-		return getZenState(player) -- unchanged
+	if not spendChi(player, cost) then
+		return getZenState(player) -- unchanged (not enough Chi)
 	end
 
-	-- Valid purchase: deduct cost and increment level.
-	spiritPower.Value -= cost
+	-- Paid: increment level. (multiplier = 2^level, cap, scaling all unchanged.)
 	zenLevel[player] = level + 1
 	return getZenState(player)
 end
@@ -494,8 +617,8 @@ end
 --------------------------------------------------------------------------------
 -- 3c. Ascend (prestige)
 --------------------------------------------------------------------------------
--- Spirit Power required to Ascend at a given count.
--- count 0 -> 10,000, count 1 -> 50,000, count 2 -> 250,000, ...
+-- CHI required to Ascend at a given count (same scaling as before, now measured in
+-- Chi). count 0 -> 10,000, count 1 -> 50,000, count 2 -> 250,000, ...
 local function getAscendRequirement(count)
 	return ASCEND_BASE_REQUIREMENT * (ASCEND_REQUIREMENT_SCALE ^ count)
 end
@@ -515,29 +638,37 @@ getAscendStateFunc.OnServerInvoke = function(player)
 	return getAscendState(player)
 end
 
--- Ascend handler — fully validated on the server.
+-- Ascend handler — fully validated on the server. The requirement is now CHI.
 buyAscendFunc.OnServerInvoke = function(player)
 	local count = ascendCount[player] or 0
 	local requirement = getAscendRequirement(count)
 
-	local leaderstats = player:FindFirstChild("leaderstats")
-	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
-
-	-- Reject if the player doesn't meet the Spirit Power requirement.
-	if not spiritPower or spiritPower.Value < requirement then
-		return getAscendState(player) -- unchanged
+	-- Reject if the player doesn't meet the CHI requirement.
+	local chi = player:FindFirstChild("Chi")
+	local heldChi = chi and chi.Value or 0
+	if heldChi < requirement then
+		return getAscendState(player) -- unchanged (not enough Chi)
 	end
 
-	-- Perform the prestige:
-	--  * reset Spirit Power to 0
+	-- Perform the prestige. CHI is the meaningful reset now:
+	--  * empty ALL Chi to 0 — routed through the spendChi chokepoint by spending the
+	--    full held balance (held -> 0)
 	--  * reset Zen level to 0
-	--  * increment Ascend count (this also raises the Zen cap via getZenCap and
-	--    strengthens all future gains via getAscendMultiplier)
-	spiritPower.Value = 0
+	--  * increment Ascend count (this still raises the Zen cap via getZenCap and
+	--    strengthens all future SPIRIT POWER gains via getAscendMultiplier — unchanged)
+	spendChi(player, heldChi)
 	zenLevel[player] = 0
 	ascendCount[player] = count + 1
-	-- NOTE: JarTier is intentionally NOT touched here — the Soul Jar persists
-	-- across Ascends.
+
+	-- Spirit Power is NO LONGER the prestige currency (it's just conversion fuel now),
+	-- but we still zero the live bar for a clean slate. JarTier is intentionally NOT
+	-- touched — the Soul Jar persists across Ascends.
+	local leaderstats = player:FindFirstChild("leaderstats")
+	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
+	if spiritPower then
+		spiritPower.Value = 0
+	end
+
 	return getAscendState(player)
 end
 
@@ -565,7 +696,9 @@ getSoulJarStateFunc.OnServerInvoke = function(player)
 	return getSoulJarState(player)
 end
 
--- Upgrade handler — fully validated on the server.
+-- Upgrade handler — fully validated on the server. Cost is now paid in CHI. The jar
+-- still CAPS Spirit Power (getSpiritCap) exactly as before — only the upgrade cost's
+-- currency changed.
 buySoulJarFunc.OnServerInvoke = function(player)
 	local tier = jarTier[player] or 0
 	local nextTier = SOUL_JAR_TIERS[tier + 2]
@@ -575,16 +708,13 @@ buySoulJarFunc.OnServerInvoke = function(player)
 		return getSoulJarState(player) -- unchanged
 	end
 
-	-- Reject if the player can't afford the upgrade.
-	local cost = nextTier.upgradeCost
-	local leaderstats = player:FindFirstChild("leaderstats")
-	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
-	if not spiritPower or spiritPower.Value < cost then
-		return getSoulJarState(player) -- unchanged
+	-- Charge the Chi cost through the spendChi chokepoint (checks affordability AND
+	-- deducts atomically). If the player can't afford it, nothing changes.
+	if not spendChi(player, nextTier.upgradeCost) then
+		return getSoulJarState(player) -- unchanged (not enough Chi)
 	end
 
-	-- Valid purchase: deduct cost and advance the tier.
-	spiritPower.Value -= cost
+	-- Paid: advance the tier.
 	jarTier[player] = tier + 1
 	return getSoulJarState(player)
 end
@@ -673,11 +803,13 @@ end
 --------------------------------------------------------------------------------
 -- 3f. Meditation Altar — convert Spirit Power into Chi (server-authoritative)
 --------------------------------------------------------------------------------
--- "Convert ALL at once": reads the player's Spirit Power, floors SP * CONVERSION_RATE
+-- "Convert ALL at once": reads the player's Spirit Power, floors SP * conversionRate
 -- into Chi, grants that Chi through the Slice-1 grantChi chokepoint, then empties the
--- jar. The graceful case (chiGained <= 0) — which happens at 0 Spirit Power OR when
--- the amount is so small the rate floors to 0 — changes NOTHING and tells the client
--- there's nothing to convert. Returns { ok, converted, message } for client feedback.
+-- jar. The conversion rate is now PER-WORLD — it's looked up from the player's CURRENT
+-- world in the WORLDS config (section 0c), so converting in a higher world yields more
+-- Chi for the same Spirit Power. The graceful case (chiGained <= 0) — which happens at
+-- 0 Spirit Power OR when the amount is so small the rate floors to 0 — changes NOTHING
+-- and tells the client there's nothing to convert. Returns { ok, converted, message }.
 convertSpiritToChiFunc.OnServerInvoke = function(player)
 	local leaderstats = player:FindFirstChild("leaderstats")
 	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
@@ -685,7 +817,8 @@ convertSpiritToChiFunc.OnServerInvoke = function(player)
 		return { ok = false, converted = 0, message = "Meditate to gather more Spirit Power first!" }
 	end
 
-	local chiGained = math.floor(spiritPower.Value * CONVERSION_RATE)
+	local conversionRate = getCurrentWorld(player).conversionRate
+	local chiGained = math.floor(spiritPower.Value * conversionRate)
 	if chiGained <= 0 then
 		-- Nothing worth converting: leave Spirit Power AND Chi untouched.
 		return { ok = false, converted = 0, message = "Meditate to gather more Spirit Power first!" }
@@ -697,6 +830,35 @@ convertSpiritToChiFunc.OnServerInvoke = function(player)
 	spiritPower.Value = 0
 
 	return { ok = true, converted = chiGained, message = "+" .. chiGained .. " Chi!" }
+end
+
+--------------------------------------------------------------------------------
+-- 3f-DEBUG. TEMPORARY world-switch hook — REMOVE BEFORE SHIPPING
+--------------------------------------------------------------------------------
+-- There's no in-game travel yet (that's a later slice), so this gives you a way to
+-- set your current world from the Studio command bar to verify the altar uses the
+-- right per-world conversion rate. It ALSO unlocks the target world so currentWorld
+-- and unlockedWorlds stay consistent.
+--
+-- USAGE (Studio command bar, while playing as the server):
+--   _G.DEBUG_setWorld(game.Players.YourName, 2)
+-- then walk into the Meditation Altar and convert — it should use world 2's rate (0.6).
+--
+-- ⚠️ TEMPORARY DEBUG ONLY — delete this whole block before release. It bypasses the
+-- (not-yet-built) unlock cost / Ascend requirement checks.
+_G.DEBUG_setWorld = function(player, index)
+	index = tonumber(index)
+	if not player or WORLDS[index] == nil then
+		warn("[DEBUG_setWorld] Bad args. Usage: _G.DEBUG_setWorld(player, validWorldIndex)")
+		return
+	end
+	currentWorld[player] = index
+	unlockedWorlds[player] = unlockedWorlds[player] or { [DEFAULT_WORLD] = true }
+	unlockedWorlds[player][index] = true -- unlock it too, so state stays consistent
+	print(string.format(
+		"[DEBUG_setWorld] %s -> world %d (%s), conversionRate = %s",
+		player.Name, index, WORLDS[index].name, tostring(WORLDS[index].conversionRate)
+	))
 end
 
 --------------------------------------------------------------------------------
@@ -963,7 +1125,10 @@ Players.PlayerRemoving:Connect(function(player)
 	jarTier[player] = nil
 	hasAutoClicker[player] = nil
 	claimedGroupReward[player] = nil
+	currentWorld[player] = nil
+	unlockedWorlds[player] = nil
 	canSave[player] = nil
+	initialized[player] = nil -- allow a clean re-setup if this player rejoins
 end)
 
 --------------------------------------------------------------------------------
