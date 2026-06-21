@@ -276,6 +276,18 @@ local function placeCharacter(player, character)
 	end
 end
 
+-- W2b PER-PLAYER VISIBILITY (state replication half). We publish each player's view
+-- location — hub vs which world — as ATTRIBUTES on the Player instance. Roblox replicates
+-- instance attributes to every client automatically and fires AttributeChanged, so each
+-- client can read where everyone is and hide the worlds/players that aren't relevant to
+-- it. This is replication ONLY: the server still owns currentWorld/atHub and performs all
+-- travel; clients merely use these values to decide what they RENDER. Call this anywhere
+-- atHub/currentWorld changes.
+local function syncWorldAttributes(player)
+	player:SetAttribute("WorldAtHub", atHub[player] ~= false)
+	player:SetAttribute("WorldIndex", currentWorld[player] or DEFAULT_WORLD)
+end
+
 --------------------------------------------------------------------------------
 -- 2b. Soul Jar (storage cap) configuration
 --------------------------------------------------------------------------------
@@ -496,6 +508,7 @@ local function setupLeaderstats(player)
 	currentWorld[player] = data.CurrentWorld
 	unlockedWorlds[player] = data.UnlockedWorlds
 	atHub[player] = data.AtHub
+	syncWorldAttributes(player) -- publish initial view location for per-player visibility
 
 	-- FIND-OR-CREATE every replicated value (never a blind Instance.new). Combined with the
 	-- guard above this guarantees exactly ONE leaderstats / Spirit Power / Chi per player,
@@ -929,6 +942,7 @@ _G.DEBUG_setWorld = function(player, index)
 	currentWorld[player] = index
 	unlockedWorlds[player] = unlockedWorlds[player] or { [DEFAULT_WORLD] = true }
 	unlockedWorlds[player][index] = true -- unlock it too, so state stays consistent
+	syncWorldAttributes(player) -- keep the replicated visibility attributes in sync
 	print(string.format(
 		"[DEBUG_setWorld] %s -> world %d (%s), conversionRate = %s",
 		player.Name, index, WORLDS[index].name, tostring(WORLDS[index].conversionRate)
@@ -1225,6 +1239,7 @@ local function travelToWorld(player, index)
 	-- TODO(W3): restrict to unlockedWorlds[player][index]; W2a intentionally allows all.
 	currentWorld[player] = index
 	atHub[player] = false
+	syncWorldAttributes(player) -- tell every client this player is now in world `index`
 	local char = player.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if hrp then
@@ -1236,6 +1251,7 @@ end
 -- the altar keeps converting at the rate of the world they were last earning in.
 local function travelToHub(player)
 	atHub[player] = true
+	syncWorldAttributes(player) -- tell every client this player is back in the hub
 	local char = player.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if hrp then
@@ -1255,7 +1271,9 @@ local function createPortal(opts)
 	part.Material = Enum.Material.Neon
 	part.Color = opts.color
 	part.Transparency = 0.35
-	part.Parent = Workspace
+	-- Parent defaults to Workspace (hub portals) but a world's RETURN portal passes the
+	-- world Model so it hides/shows together with that world for per-player visibility.
+	part.Parent = opts.parent or Workspace
 
 	local light = Instance.new("PointLight")
 	light.Color = opts.color
@@ -1289,8 +1307,123 @@ local function createPortal(opts)
 	return part
 end
 
--- Build one themed earning-area world: floor, low perimeter walls (so you can't walk
--- off into the void), a central accent, a big floating name sign, and a return portal.
+-- ███ PLACEHOLDER — FUTURE BOSS ARENA (no combat yet) ████████████████████████████
+-- Reserves a clearly-marked, EMPTY circular zone inside a world for a future combat
+-- phase. It is intentionally PURELY decorative: a raised platform, a glowing rim, a
+-- ring of roped-off posts, and a "Boss Arena (Coming Soon)" sign. There is NO boss, NO
+-- health, NO damage, NO combat logic of any kind here — the only purpose is to lock in
+-- the physical space/layout now so a boss system can be dropped in later WITHOUT having
+-- to relay out the worlds. The interior is left empty on purpose (room for the boss).
+-- `arenaCenter` sits off to the +X side, away from the central earning spot, the world
+-- sign, and the return portal, so it never interferes with the earning area.
+local function createBossArenaPlaceholder(model, center)
+	local arenaCenter = center + Vector3.new(58, 0, 0) -- +X side, clear of earning/spawn
+	local ARENA_RADIUS = 20
+
+	-- Raised circular platform — visually distinct (dark stone) from the world floor.
+	local platform = Instance.new("Part")
+	platform.Name = "BossArenaPlaceholder" -- future combat phase hooks onto this
+	platform.Shape = Enum.PartType.Cylinder
+	platform.Anchored = true
+	platform.Size = Vector3.new(1, ARENA_RADIUS * 2, ARENA_RADIUS * 2) -- 1 = thickness
+	platform.Orientation = Vector3.new(0, 0, 90) -- lay the round face up
+	platform.Position = arenaCenter + Vector3.new(0, 0.5, 0)
+	platform.Material = Enum.Material.Slate
+	platform.Color = Color3.fromRGB(70, 64, 78)
+	platform.Parent = model
+
+	-- Glowing amber rim just under the platform edge — the "reserved zone" marking.
+	local rim = Instance.new("Part")
+	rim.Name = "BossArenaRim"
+	rim.Shape = Enum.PartType.Cylinder
+	rim.Anchored = true
+	rim.Size = Vector3.new(0.6, ARENA_RADIUS * 2 + 6, ARENA_RADIUS * 2 + 6)
+	rim.Orientation = Vector3.new(0, 0, 90)
+	rim.Position = arenaCenter + Vector3.new(0, 0.3, 0)
+	rim.Material = Enum.Material.Neon
+	rim.Color = Color3.fromRGB(255, 170, 60)
+	rim.Parent = model
+
+	-- Ring of short "roped-off" posts around the perimeter (decorative only).
+	for i = 0, 7 do
+		local ang = math.rad(i * 45)
+		local post = Instance.new("Part")
+		post.Name = "BossArenaPost"
+		post.Anchored = true
+		post.Size = Vector3.new(1.5, 5, 1.5)
+		post.Position = Vector3.new(
+			arenaCenter.X + math.cos(ang) * (ARENA_RADIUS + 2),
+			2.5,
+			arenaCenter.Z + math.sin(ang) * (ARENA_RADIUS + 2)
+		)
+		post.Material = Enum.Material.Metal
+		post.Color = Color3.fromRGB(95, 90, 105)
+		post.Parent = model
+	end
+
+	-- "Boss Arena (Coming Soon)" sign on a post at the near edge (keeps the centre empty).
+	local signPost = Instance.new("Part")
+	signPost.Name = "BossArenaSignPost"
+	signPost.Anchored = true
+	signPost.Size = Vector3.new(1.5, 16, 1.5)
+	signPost.Position = Vector3.new(arenaCenter.X, 8, arenaCenter.Z - (ARENA_RADIUS + 2))
+	signPost.Material = Enum.Material.Metal
+	signPost.Color = Color3.fromRGB(95, 90, 105)
+	signPost.Parent = model
+
+	local sign = Instance.new("BillboardGui")
+	sign.Name = "BossArenaSign"
+	sign.Size = UDim2.fromScale(16, 5)
+	sign.StudsOffsetWorldSpace = Vector3.new(0, 10, 0)
+	sign.AlwaysOnTop = true
+	sign.Adornee = signPost
+	sign.Parent = signPost
+
+	local signLabel = Instance.new("TextLabel")
+	signLabel.Size = UDim2.fromScale(1, 1)
+	signLabel.BackgroundTransparency = 1
+	signLabel.Text = "Boss Arena\n(Coming Soon)"
+	signLabel.Font = Enum.Font.FredokaOne
+	signLabel.TextScaled = true
+	signLabel.TextColor3 = Color3.fromRGB(255, 205, 130)
+	signLabel.TextStrokeTransparency = 0.3
+	signLabel.TextStrokeColor3 = Color3.fromRGB(30, 20, 10)
+	signLabel.Parent = sign
+end
+-- ████████████████████████████████████████████████████████████████████████████████
+
+-- Tall INVISIBLE collision barrier around a square area so players cannot walk OR jump
+-- off the platform into the void. Used for every world AND the hub. Height is far above
+-- the default ~7-stud jump, and the walls sit at the platform EDGE so the whole interior
+-- (including the portals, which are placed well inside each area) stays reachable.
+local BARRIER_HEIGHT = 30 -- way above jump height; unjumpable
+local BARRIER_THICKNESS = 2
+local function createBarrier(parent, groundCenter, span)
+	local half = span / 2
+	local yMid = BARRIER_HEIGHT / 2 -- base sits on the ground (y = 0 of the platform top)
+	-- z-walls overhang by the thickness on each end so the corners are sealed.
+	local defs = {
+		{ Vector3.new(span + BARRIER_THICKNESS * 2, BARRIER_HEIGHT, BARRIER_THICKNESS), Vector3.new(0, yMid, half) },
+		{ Vector3.new(span + BARRIER_THICKNESS * 2, BARRIER_HEIGHT, BARRIER_THICKNESS), Vector3.new(0, yMid, -half) },
+		{ Vector3.new(BARRIER_THICKNESS, BARRIER_HEIGHT, span), Vector3.new(half, yMid, 0) },
+		{ Vector3.new(BARRIER_THICKNESS, BARRIER_HEIGHT, span), Vector3.new(-half, yMid, 0) },
+	}
+	for _, def in ipairs(defs) do
+		local wall = Instance.new("Part")
+		wall.Name = "EdgeBarrier"
+		wall.Anchored = true
+		wall.CanCollide = true -- the whole point: blocks players
+		wall.Transparency = 1 -- invisible
+		wall.CastShadow = false
+		wall.Size = def[1]
+		wall.Position = groundCenter + def[2]
+		wall.Parent = parent
+	end
+end
+
+-- Build one themed earning-area world: floor, a low decorative perimeter rim, a tall
+-- invisible edge barrier (so you can't walk/jump off), a central accent, a big floating
+-- name sign, and a return portal.
 local function createWorldArea(opts)
 	-- opts: index, name, floorColor, floorMaterial, accentColor, signColor, mist (bool).
 	local center = WORLD_CENTERS[opts.index]
@@ -1307,7 +1440,7 @@ local function createWorldArea(opts)
 	floor.Color = opts.floorColor
 	floor.Parent = model
 
-	-- Low, semi-transparent perimeter walls keep players on the floating platform.
+	-- Low, semi-transparent perimeter rim — purely a VISUAL edge cue.
 	local WALL_H = 7
 	local wallDefs = {
 		{ Vector3.new(WORLD_FLOOR_SIZE, WALL_H, 2), Vector3.new(0, WALL_H / 2, half) },
@@ -1325,6 +1458,11 @@ local function createWorldArea(opts)
 		wall.Transparency = 0.5
 		wall.Parent = model
 	end
+
+	-- The ACTUAL containment: a tall invisible barrier at the platform edge so players
+	-- can't walk or jump off into the void. The return portal sits well inside (z+60 of a
+	-- ±90 floor), so it stays reachable. Parented to the model so it travels with the world.
+	createBarrier(model, center, WORLD_FLOOR_SIZE)
 
 	-- Central glowing accent disc — instant visual identity for the world.
 	local accent = Instance.new("Part")
@@ -1381,15 +1519,20 @@ local function createWorldArea(opts)
 	signLabel.TextStrokeColor3 = Color3.fromRGB(15, 15, 25)
 	signLabel.Parent = sign
 
+	-- Reserve the (empty) future boss-arena space inside this world. Placeholder only.
+	createBossArenaPlaceholder(model, center)
+
 	model.Parent = Workspace
 
 	-- Return-to-hub portal sitting inside this world (offset from the spawn point).
+	-- Parented INTO the world model so it hides/shows with the world (per-player W2b).
 	createPortal({
 		name = "ReturnPortal" .. opts.index,
 		position = center + RETURN_PORTAL_OFFSET,
 		color = Color3.fromRGB(255, 225, 150),
 		label = "↩ Return to Hub",
 		onEnter = travelToHub,
+		parent = model,
 	})
 end
 
@@ -1431,6 +1574,12 @@ hubSpawn.Position = Vector3.new(0, 0.5, 0)
 hubSpawn.Material = Enum.Material.SmoothPlastic
 hubSpawn.Color = Color3.fromRGB(230, 225, 245)
 hubSpawn.Parent = Workspace
+
+-- Hub edge barrier: a tall invisible wall around the baseplate rim (512x512 → ±256) so
+-- players can't walk/jump off the hub into the void. All hub pads and the world portals
+-- sit far inside this (within ~±80), so nothing gets blocked. Parented to Workspace (the
+-- hub is always-visible neutral space, so it never hides per-player).
+createBarrier(Workspace, Vector3.new(0, 0, 0), 512)
 
 -- "CENTRAL HUB" floating sign so the neutral hub is clearly labeled.
 local hubSignPost = Instance.new("Part")
