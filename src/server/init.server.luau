@@ -102,6 +102,29 @@ local WORLDS = {
 local DEFAULT_WORLD = 1 -- index every player starts in / owns by default
 
 --------------------------------------------------------------------------------
+-- 0d. PHYSICAL LAYOUT (Slice W2a: hub + three earning-area worlds + travel)
+--------------------------------------------------------------------------------
+-- One place, many areas (NOT separate Roblox places). The HUB is a neutral space
+-- holding every pad (Shop/Ascend/Group/Altar); each WORLD is a far-away themed
+-- platform you stand on to click-earn. Coordinates are deliberately far apart so the
+-- areas never overlap. Edit these to move things around.
+local HUB_SPAWN = Vector3.new(0, 5, 0) -- where the hub places a character (HumanoidRootPart)
+local WORLD_CENTERS = { -- ground center of each world platform
+	[1] = Vector3.new(1600, 0, 0),
+	[2] = Vector3.new(0, 0, 1600),
+	[3] = Vector3.new(-1600, 0, 0),
+}
+local WORLD_FLOOR_SIZE = 180 -- square world platform (studs)
+local WORLD_SPAWN_OFFSET = Vector3.new(0, 5, 0) -- HRP height above a world's center
+local RETURN_PORTAL_OFFSET = Vector3.new(0, 4, 60) -- return portal placement within a world
+
+-- Spawn CFrame for a world index (falls back to the starter world if unknown).
+local function worldSpawnCFrame(index)
+	local center = WORLD_CENTERS[index] or WORLD_CENTERS[DEFAULT_WORLD]
+	return CFrame.new(center + WORLD_SPAWN_OFFSET)
+end
+
+--------------------------------------------------------------------------------
 -- 1. RemoteEvents
 --------------------------------------------------------------------------------
 -- Created here on the server and parented to ReplicatedStorage so the client can
@@ -185,6 +208,19 @@ local convertSpiritToChiFunc = Instance.new("RemoteFunction")
 convertSpiritToChiFunc.Name = "ConvertSpiritToChi"
 convertSpiritToChiFunc.Parent = ReplicatedStorage
 
+-- W2a TRAVEL. Client fires this to REQUEST travel; the SERVER owns the move (sets
+-- currentWorld + teleports). Payload: a number — 0 = hub, 1..N = world index. The
+-- client never sets its own world (server-authoritative).
+local requestTravelEvent = Instance.new("RemoteEvent")
+requestTravelEvent.Name = "RequestTravel"
+requestTravelEvent.Parent = ReplicatedStorage
+
+-- Client invokes this to populate the HUD "Worlds" menu: the world list (index+name)
+-- plus where the player currently is (atHub / currentWorld).
+local getWorldsStateFunc = Instance.new("RemoteFunction")
+getWorldsStateFunc.Name = "GetWorldsState"
+getWorldsStateFunc.Parent = ReplicatedStorage
+
 --------------------------------------------------------------------------------
 -- 2. Player progression tables
 --------------------------------------------------------------------------------
@@ -212,11 +248,32 @@ local claimedGroupReward = {}
 -- starter world. These are seeded from saved data in setupLeaderstats.
 local currentWorld = {} -- [player] = world index (default 1)
 local unlockedWorlds = {} -- [player] = { [index] = true } set of unlocked worlds
+-- [player] = true when the player is physically in the HUB, false when in their
+-- currentWorld's area (W2a). Saved so a rejoin restores the right area. The hub uses a
+-- 1x click multiplier (see applyClick); currentWorld still drives the altar rate even
+-- while in the hub (you earn in a world, then convert at that world's rate in the hub).
+local atHub = {}
 
 -- The config row for the world a player is currently in. Falls back to the starter
 -- world if the stored index is ever missing/invalid, so callers always get a world.
 local function getCurrentWorld(player)
 	return WORLDS[currentWorld[player] or DEFAULT_WORLD] or WORLDS[DEFAULT_WORLD]
+end
+
+-- Where to place this player's character on spawn: the hub, or their current world.
+local function spawnCFrameFor(player)
+	if atHub[player] == false then -- explicitly in a world (nil/true both mean hub)
+		return worldSpawnCFrame(currentWorld[player] or DEFAULT_WORLD)
+	end
+	return CFrame.new(HUB_SPAWN)
+end
+
+-- Teleport a (possibly still-loading) character to a CFrame.
+local function placeCharacter(player, character)
+	local hrp = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 5)
+	if hrp then
+		hrp.CFrame = spawnCFrameFor(player)
+	end
 end
 
 --------------------------------------------------------------------------------
@@ -281,6 +338,8 @@ local function makeDefaults()
 		-- form: { [index] = true }). New players start in / own only the starter world.
 		CurrentWorld = DEFAULT_WORLD,
 		UnlockedWorlds = { [DEFAULT_WORLD] = true },
+		-- New players start in the neutral hub (where all the pads are), not inside a world.
+		AtHub = true,
 	}
 end
 
@@ -339,6 +398,9 @@ local function loadPlayerData(player)
 		Chi = tonumber(result.Chi) or 0,
 		CurrentWorld = savedCurrent,
 		UnlockedWorlds = savedUnlocked, -- SET form (in-memory); serialized as array on save
+		-- Physical location. Missing (older saves) reads as true = the hub, a safe default
+		-- that drops the player at the pads rather than stranding them in a world.
+		AtHub = result.AtHub ~= false,
 	}, true
 end
 
@@ -372,6 +434,7 @@ local function savePlayerData(player)
 		Chi = chi and chi.Value or 0,
 		CurrentWorld = currentWorld[player] or DEFAULT_WORLD,
 		UnlockedWorlds = unlockedArray,
+		AtHub = atHub[player] ~= false, -- default true (hub) for anyone never placed in a world
 	}
 
 	local attempt = 0
@@ -432,6 +495,7 @@ local function setupLeaderstats(player)
 	-- is already a SET (built by loadPlayerData / makeDefaults), so assign directly.
 	currentWorld[player] = data.CurrentWorld
 	unlockedWorlds[player] = data.UnlockedWorlds
+	atHub[player] = data.AtHub
 
 	-- FIND-OR-CREATE every replicated value (never a blind Instance.new). Combined with the
 	-- guard above this guarantees exactly ONE leaderstats / Spirit Power / Chi per player,
@@ -465,6 +529,16 @@ local function setupLeaderstats(player)
 		chi.Parent = player
 	end
 	chi.Value = data.Chi
+
+	-- Now that this player's saved location is known, place their character in the right
+	-- area (hub or their world) — both for the current character and every future respawn.
+	-- Connecting here (after the load) guarantees spawnCFrameFor reads valid state.
+	player.CharacterAdded:Connect(function(character)
+		placeCharacter(player, character)
+	end)
+	if player.Character then
+		placeCharacter(player, player.Character)
+	end
 end
 
 -- Handle players who join after this script runs...
@@ -878,9 +952,22 @@ local lastClickTime = {} -- [player] = os.clock() of last accepted click
 -- (which layers on the Ascend multiplier and the Soul Jar soft cap). Both manual
 -- clicks AND the auto-clicker call this, so they behave IDENTICALLY apart from the
 -- base amount each passes in.
+-- Per-world click bonus (W2a). In a world, click-earn is scaled by that world's
+-- clickMultiplier; in the hub it's 1x (the hub is neutral — no earning bonus). This
+-- stacks on top of Zen here, and grantSpiritPower then layers the Ascend multiplier
+-- and the Soul Jar soft cap. (jarCapMultiplier is intentionally NOT applied yet — W2b+.)
+local function getWorldClickMultiplier(player)
+	if atHub[player] ~= false then
+		return 1 -- hub (or unset) = neutral 1x
+	end
+	local world = WORLDS[currentWorld[player] or DEFAULT_WORLD]
+	return (world and world.clickMultiplier) or 1
+end
+
 local function applyClick(player, baseAmount)
-	local multiplier = getZenMultiplier(zenLevel[player] or 0)
-	grantSpiritPower(player, (baseAmount or CLICK_BASE_AMOUNT) * multiplier)
+	local zen = getZenMultiplier(zenLevel[player] or 0)
+	local world = getWorldClickMultiplier(player)
+	grantSpiritPower(player, (baseAmount or CLICK_BASE_AMOUNT) * zen * world)
 end
 
 clickEarnEvent.OnServerEvent:Connect(function(player)
@@ -1110,6 +1197,316 @@ createMonumentPad({
 })
 
 --------------------------------------------------------------------------------
+-- 5b. Hub spawn + travel portals + the three earning-area worlds (Slice W2a)
+--------------------------------------------------------------------------------
+-- Travel is SERVER-AUTHORITATIVE: the server sets currentWorld/atHub and teleports the
+-- character. Both portals (walked into) and the HUD "Worlds" menu funnel through the
+-- same travelToWorld/travelToHub below. W2a allows travel to ANY world regardless of
+-- unlock status; the unlock GATING arrives in slice W3 (see TODOs).
+
+-- Brief per-player cooldown so arriving on top of a portal can't instantly re-trigger it.
+local travelDebounce = {} -- [player] = true for a moment after any travel
+local function canTravel(player)
+	if travelDebounce[player] then
+		return false
+	end
+	travelDebounce[player] = true
+	task.delay(1.2, function()
+		travelDebounce[player] = nil
+	end)
+	return true
+end
+
+-- Move a player INTO a world: set state (server owns it) then teleport their body.
+local function travelToWorld(player, index)
+	if not WORLDS[index] then
+		return
+	end
+	-- TODO(W3): restrict to unlockedWorlds[player][index]; W2a intentionally allows all.
+	currentWorld[player] = index
+	atHub[player] = false
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if hrp then
+		hrp.CFrame = worldSpawnCFrame(index)
+	end
+end
+
+-- Move a player back to the neutral hub. currentWorld is intentionally left as-is, so
+-- the altar keeps converting at the rate of the world they were last earning in.
+local function travelToHub(player)
+	atHub[player] = true
+	local char = player.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if hrp then
+		hrp.CFrame = CFrame.new(HUB_SPAWN)
+	end
+end
+
+-- A walk-through portal: a glowing translucent slab with a floating label.
+local function createPortal(opts)
+	-- opts: name, position (Vector3 center), color, label, onEnter (function(player)).
+	local part = Instance.new("Part")
+	part.Name = opts.name
+	part.Size = Vector3.new(10, 12, 2)
+	part.Position = opts.position
+	part.Anchored = true
+	part.CanCollide = false
+	part.Material = Enum.Material.Neon
+	part.Color = opts.color
+	part.Transparency = 0.35
+	part.Parent = Workspace
+
+	local light = Instance.new("PointLight")
+	light.Color = opts.color
+	light.Brightness = 4
+	light.Range = 16
+	light.Parent = part
+
+	local billboard = Instance.new("BillboardGui")
+	billboard.Size = UDim2.fromScale(9, 2.4)
+	billboard.StudsOffsetWorldSpace = Vector3.new(0, 8, 0)
+	billboard.AlwaysOnTop = true
+	billboard.Adornee = part
+	billboard.Parent = part
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Text = opts.label
+	label.Font = Enum.Font.FredokaOne
+	label.TextScaled = true
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.TextStrokeTransparency = 0.3
+	label.Parent = billboard
+
+	part.Touched:Connect(function(hit)
+		local plr = Players:GetPlayerFromCharacter(hit.Parent)
+		if plr and canTravel(plr) then
+			opts.onEnter(plr)
+		end
+	end)
+	return part
+end
+
+-- Build one themed earning-area world: floor, low perimeter walls (so you can't walk
+-- off into the void), a central accent, a big floating name sign, and a return portal.
+local function createWorldArea(opts)
+	-- opts: index, name, floorColor, floorMaterial, accentColor, signColor, mist (bool).
+	local center = WORLD_CENTERS[opts.index]
+	local half = WORLD_FLOOR_SIZE / 2
+	local model = Instance.new("Model")
+	model.Name = "World" .. opts.index
+
+	local floor = Instance.new("Part")
+	floor.Name = "Floor"
+	floor.Anchored = true
+	floor.Size = Vector3.new(WORLD_FLOOR_SIZE, 2, WORLD_FLOOR_SIZE)
+	floor.Position = center + Vector3.new(0, -1, 0) -- top surface at y = 0
+	floor.Material = opts.floorMaterial
+	floor.Color = opts.floorColor
+	floor.Parent = model
+
+	-- Low, semi-transparent perimeter walls keep players on the floating platform.
+	local WALL_H = 7
+	local wallDefs = {
+		{ Vector3.new(WORLD_FLOOR_SIZE, WALL_H, 2), Vector3.new(0, WALL_H / 2, half) },
+		{ Vector3.new(WORLD_FLOOR_SIZE, WALL_H, 2), Vector3.new(0, WALL_H / 2, -half) },
+		{ Vector3.new(2, WALL_H, WORLD_FLOOR_SIZE), Vector3.new(half, WALL_H / 2, 0) },
+		{ Vector3.new(2, WALL_H, WORLD_FLOOR_SIZE), Vector3.new(-half, WALL_H / 2, 0) },
+	}
+	for _, def in ipairs(wallDefs) do
+		local wall = Instance.new("Part")
+		wall.Anchored = true
+		wall.Size = def[1]
+		wall.Position = center + def[2]
+		wall.Material = Enum.Material.SmoothPlastic
+		wall.Color = opts.accentColor
+		wall.Transparency = 0.5
+		wall.Parent = model
+	end
+
+	-- Central glowing accent disc — instant visual identity for the world.
+	local accent = Instance.new("Part")
+	accent.Name = "Accent"
+	accent.Shape = Enum.PartType.Cylinder
+	accent.Anchored = true
+	accent.Size = Vector3.new(0.6, 44, 44)
+	accent.Orientation = Vector3.new(0, 0, 90)
+	accent.Position = center + Vector3.new(0, 0.3, 0)
+	accent.Material = Enum.Material.Neon
+	accent.Color = opts.accentColor
+	accent.Parent = model
+
+	-- Optional drifting "mist" layer (Whispering Highlands).
+	if opts.mist then
+		local mist = Instance.new("Part")
+		mist.Name = "Mist"
+		mist.Anchored = true
+		mist.CanCollide = false
+		mist.Size = Vector3.new(WORLD_FLOOR_SIZE, 0.4, WORLD_FLOOR_SIZE)
+		mist.Position = center + Vector3.new(0, 6, 0)
+		mist.Material = Enum.Material.ForceField
+		mist.Color = Color3.fromRGB(210, 225, 240)
+		mist.Transparency = 0.4
+		mist.Parent = model
+	end
+
+	-- Big floating name sign on a post so it's obvious which world you're standing in.
+	local post = Instance.new("Part")
+	post.Name = "SignPost"
+	post.Anchored = true
+	post.Size = Vector3.new(2, 26, 2)
+	post.Position = center + Vector3.new(0, 13, -30)
+	post.Material = Enum.Material.WoodPlanks
+	post.Color = opts.accentColor
+	post.Parent = model
+
+	local sign = Instance.new("BillboardGui")
+	sign.Name = "WorldSign"
+	sign.Size = UDim2.fromScale(24, 6)
+	sign.StudsOffsetWorldSpace = Vector3.new(0, 16, 0)
+	sign.AlwaysOnTop = true
+	sign.Adornee = post
+	sign.Parent = post
+
+	local signLabel = Instance.new("TextLabel")
+	signLabel.Size = UDim2.fromScale(1, 1)
+	signLabel.BackgroundTransparency = 1
+	signLabel.Text = opts.name
+	signLabel.Font = Enum.Font.FredokaOne
+	signLabel.TextScaled = true
+	signLabel.TextColor3 = opts.signColor
+	signLabel.TextStrokeTransparency = 0.3
+	signLabel.TextStrokeColor3 = Color3.fromRGB(15, 15, 25)
+	signLabel.Parent = sign
+
+	model.Parent = Workspace
+
+	-- Return-to-hub portal sitting inside this world (offset from the spawn point).
+	createPortal({
+		name = "ReturnPortal" .. opts.index,
+		position = center + RETURN_PORTAL_OFFSET,
+		color = Color3.fromRGB(255, 225, 150),
+		label = "↩ Return to Hub",
+		onEnter = travelToHub,
+	})
+end
+
+-- The three worlds. Names/order mirror the WORLDS config; themes make each distinct.
+createWorldArea({
+	index = 1,
+	name = "Tranquil Grove",
+	floorColor = Color3.fromRGB(86, 160, 72),
+	floorMaterial = Enum.Material.Grass,
+	accentColor = Color3.fromRGB(55, 120, 55),
+	signColor = Color3.fromRGB(190, 255, 180),
+})
+createWorldArea({
+	index = 2,
+	name = "Whispering Highlands",
+	floorColor = Color3.fromRGB(120, 140, 165),
+	floorMaterial = Enum.Material.Slate,
+	accentColor = Color3.fromRGB(90, 115, 150),
+	signColor = Color3.fromRGB(205, 225, 245),
+	mist = true,
+})
+createWorldArea({
+	index = 3,
+	name = "Celestial Summit",
+	floorColor = Color3.fromRGB(96, 74, 150),
+	floorMaterial = Enum.Material.Marble,
+	accentColor = Color3.fromRGB(255, 205, 90),
+	signColor = Color3.fromRGB(255, 235, 175),
+})
+
+-- Hub SpawnLocation so every fresh character first appears in the neutral hub. (On
+-- rejoin, setupLeaderstats teleports anyone whose saved location is a world.)
+local hubSpawn = Instance.new("SpawnLocation")
+hubSpawn.Name = "HubSpawn"
+hubSpawn.Anchored = true
+hubSpawn.Neutral = true
+hubSpawn.Size = Vector3.new(14, 1, 14)
+hubSpawn.Position = Vector3.new(0, 0.5, 0)
+hubSpawn.Material = Enum.Material.SmoothPlastic
+hubSpawn.Color = Color3.fromRGB(230, 225, 245)
+hubSpawn.Parent = Workspace
+
+-- "CENTRAL HUB" floating sign so the neutral hub is clearly labeled.
+local hubSignPost = Instance.new("Part")
+hubSignPost.Name = "HubSignPost"
+hubSignPost.Anchored = true
+hubSignPost.Size = Vector3.new(2, 22, 2)
+hubSignPost.Position = Vector3.new(0, 11, 12)
+hubSignPost.Material = Enum.Material.Marble
+hubSignPost.Color = Color3.fromRGB(120, 110, 150)
+hubSignPost.Parent = Workspace
+
+local hubSign = Instance.new("BillboardGui")
+hubSign.Name = "HubSign"
+hubSign.Size = UDim2.fromScale(20, 5)
+hubSign.StudsOffsetWorldSpace = Vector3.new(0, 14, 0)
+hubSign.AlwaysOnTop = true
+hubSign.Adornee = hubSignPost
+hubSign.Parent = hubSignPost
+
+local hubSignLabel = Instance.new("TextLabel")
+hubSignLabel.Size = UDim2.fromScale(1, 1)
+hubSignLabel.BackgroundTransparency = 1
+hubSignLabel.Text = "CENTRAL HUB"
+hubSignLabel.Font = Enum.Font.FredokaOne
+hubSignLabel.TextScaled = true
+hubSignLabel.TextColor3 = Color3.fromRGB(245, 240, 255)
+hubSignLabel.TextStrokeTransparency = 0.3
+hubSignLabel.TextStrokeColor3 = Color3.fromRGB(20, 18, 30)
+hubSignLabel.Parent = hubSign
+
+-- One portal per world, in a row on the far (-Z) side of the hub so they never overlap
+-- the pads (which sit around z = ±24). Each portal's color matches its world's theme.
+local HUB_PORTAL_DEFS = {
+	{ index = 1, x = -60, color = Color3.fromRGB(90, 200, 90), name = "Tranquil Grove" },
+	{ index = 2, x = 0, color = Color3.fromRGB(130, 160, 195), name = "Whispering Highlands" },
+	{ index = 3, x = 60, color = Color3.fromRGB(180, 130, 245), name = "Celestial Summit" },
+}
+for _, def in ipairs(HUB_PORTAL_DEFS) do
+	createPortal({
+		name = "HubPortal" .. def.index,
+		position = Vector3.new(def.x, 6, -72),
+		color = def.color,
+		label = "→ " .. def.name,
+		onEnter = function(plr)
+			travelToWorld(plr, def.index)
+		end,
+	})
+end
+
+-- Client → server travel request (HUD Worlds menu). 0 = hub, 1..N = world index.
+requestTravelEvent.OnServerEvent:Connect(function(player, target)
+	if typeof(target) ~= "number" or not canTravel(player) then
+		return
+	end
+	if target == 0 then
+		travelToHub(player)
+	elseif WORLDS[target] then
+		-- TODO(W3): restrict to unlockedWorlds[player][target]; W2a allows all.
+		travelToWorld(player, target)
+	end
+end)
+
+-- Client reads the world list + its current location to render the Worlds menu.
+getWorldsStateFunc.OnServerInvoke = function(player)
+	local worlds = {}
+	for index, world in ipairs(WORLDS) do
+		table.insert(worlds, { index = index, name = world.name })
+	end
+	return {
+		atHub = atHub[player] ~= false,
+		currentWorld = currentWorld[player] or DEFAULT_WORLD,
+		worlds = worlds,
+	}
+end
+
+--------------------------------------------------------------------------------
 -- 6. Save on leave + per-player cleanup
 --------------------------------------------------------------------------------
 Players.PlayerRemoving:Connect(function(player)
@@ -1127,6 +1524,8 @@ Players.PlayerRemoving:Connect(function(player)
 	claimedGroupReward[player] = nil
 	currentWorld[player] = nil
 	unlockedWorlds[player] = nil
+	atHub[player] = nil
+	travelDebounce[player] = nil
 	canSave[player] = nil
 	initialized[player] = nil -- allow a clean re-setup if this player rejoins
 end)
