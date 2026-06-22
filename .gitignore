@@ -6,3 +6,9 @@
 /*.rbxl.lock
 
 sourcemap.json
+
+# Wally packages — restored with `wally install`.
+# Commit wally.toml + wally.lock; the downloaded packages stay out of Git.
+/Packages/
+/ServerPackages/
+/DevPackages/
