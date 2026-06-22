@@ -12,6 +12,17 @@ local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 local openShopEvent = ReplicatedStorage:WaitForChild("OpenShop")
 
+-- Fusion (installed via Wally, synced by Rojo into ReplicatedStorage.Packages) powers the
+-- currency HUD below. We keep the rest of this script's plain-GUI popups as-is; only the
+-- always-on currency HUD (Chi + Spirit Power pills) and the rank title were migrated to
+-- Fusion so they auto-update from reactive state — same pattern as StatsPanel.client.luau.
+local Fusion = require(ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Fusion"))
+
+-- Shared number formatter: abbreviates big values (612436 → "612K", 10000000 → "10M").
+-- Lives in ReplicatedStorage.Shared so other UI can reuse it. Used by the HUD pills below.
+local NumberFormat = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("NumberFormat"))
+local abbreviate = NumberFormat.abbreviate
+
 -- Tab definitions: order here is the order shown along the top.
 -- Ascend moved out to its own world pad/popup, so the shop is just Zen + Soul Jar.
 local TABS = { "Zen", "Soul Jar" }
@@ -505,151 +516,319 @@ hud.ResetOnSpawn = false
 hud.IgnoreGuiInset = true
 hud.Parent = playerGui
 
--- The whole HUD is a centered vertical stack: rank title, then the Spirit Power
--- "vessel" bar, then the Chi bank counter. A UIListLayout keeps the three pieces
--- tidy and non-overlapping regardless of text length.
-local hudStack = Instance.new("Frame")
-hudStack.Name = "Stack"
-hudStack.AnchorPoint = Vector2.new(0.5, 0)
-hudStack.Position = UDim2.new(0.5, 0, 0, 12)
-hudStack.Size = UDim2.fromOffset(440, 150)
-hudStack.BackgroundTransparency = 1
-hudStack.Parent = hud
+-- ─────────────────────────────────────────────────────────────────────────────
+-- FUSION currency HUD (migrated from the old plain-GUI stack above).
+--
+-- The currencies are now rounded "pill" badges stacked in the TOP-LEFT corner, and
+-- the rank title moved to the BOTTOM-CENTER. All four pieces of data — Spirit Power
+-- held, the Soul Jar capacity, Chi, and the ascension rank — live in Fusion Values.
+-- The three updateHud* functions below (called from the SAME places as before:
+-- Spirit Power/Chi .Changed handlers, the Soul Jar render, and the Ascend render)
+-- just `:set()` those Values, and the bound Computeds repaint the pills + rank
+-- automatically. This keeps the live-updating behavior identical to the old HUD —
+-- only the visuals and layout changed. Same Fusion pattern as StatsPanel.client.luau.
+-- ─────────────────────────────────────────────────────────────────────────────
 
-local hudLayout = Instance.new("UIListLayout")
-hudLayout.FillDirection = Enum.FillDirection.Vertical
-hudLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-hudLayout.SortOrder = Enum.SortOrder.LayoutOrder
-hudLayout.Padding = UDim.new(0, 8)
-hudLayout.Parent = hudStack
+local scope = Fusion.scoped(Fusion)
+local Children = Fusion.Children
 
--- (1) Big COLOR-CODED rank title at the top of the stack.
-local rankDisplay = Instance.new("TextLabel")
-rankDisplay.Name = "RankDisplay"
-rankDisplay.LayoutOrder = 1
-rankDisplay.Size = UDim2.fromOffset(360, 38)
-rankDisplay.BackgroundTransparency = 1
-rankDisplay.Font = FONT
-rankDisplay.TextScaled = true
-rankDisplay.TextStrokeTransparency = 0.45
-rankDisplay.TextStrokeColor3 = Color3.fromRGB(20, 20, 28)
-rankDisplay.Text = "Seeker"
-rankDisplay.Parent = hudStack
+-- Cartoony styling helpers (mirrors the stats panel's look).
+local OUTLINE = Color3.fromRGB(18, 14, 28) -- thick dark cartoon border
+local function lighten(c, t)
+	return c:Lerp(Color3.new(1, 1, 1), t)
+end
+local function darken(c, t)
+	return c:Lerp(Color3.new(0, 0, 0), t)
+end
+-- Glossy vertical "candy" gradient: bright top sheen, crisp midpoint reflection,
+-- richer bottom — the static shine used on the chunky numbers + rank.
+local function candyGradient(base)
+	return ColorSequence.new({
+		ColorSequenceKeypoint.new(0.00, lighten(base, 0.65)),
+		ColorSequenceKeypoint.new(0.48, lighten(base, 0.10)),
+		ColorSequenceKeypoint.new(0.50, base),
+		ColorSequenceKeypoint.new(1.00, darken(base, 0.28)),
+	})
+end
 
-local rankCap = Instance.new("UITextSizeConstraint")
-rankCap.MaxTextSize = 34
-rankCap.Parent = rankDisplay
-
--- (2) SILVER Spirit Power vessel BAR. A dark rounded track with a silver fill that
--- grows toward the current Soul Jar capacity, plus the "held / cap" text on top —
--- so the player can literally see their vessel filling ("getting full, time to
--- convert"). Keeps the silver styling of the old counter.
-local spiritBar = Instance.new("Frame")
-spiritBar.Name = "SpiritBar"
-spiritBar.LayoutOrder = 2
-spiritBar.Size = UDim2.fromOffset(420, 46)
-spiritBar.BackgroundColor3 = Color3.fromRGB(38, 40, 52) -- dark track behind the fill
-spiritBar.Parent = hudStack
-round(spiritBar, 14)
-stroke(spiritBar, Color3.fromRGB(120, 126, 140), 2) -- silver rim
-
--- The fill. Its width scales 0..1 with held/cap; its own rounded corners match the
--- track so the left end stays clean at any fill level.
-local spiritFill = Instance.new("Frame")
-spiritFill.Name = "Fill"
-spiritFill.AnchorPoint = Vector2.new(0, 0.5)
-spiritFill.Position = UDim2.fromScale(0, 0.5)
-spiritFill.Size = UDim2.fromScale(0, 1)
-spiritFill.BackgroundColor3 = Color3.fromRGB(190, 196, 210) -- silver
-spiritFill.BorderSizePixel = 0
-spiritFill.Parent = spiritBar
-round(spiritFill, 14)
-
--- Subtle vertical sheen so the silver fill reads as a polished metal vessel.
-local fillGradient = Instance.new("UIGradient")
-fillGradient.Rotation = 90
-fillGradient.Color = ColorSequence.new(
-	Color3.fromRGB(228, 232, 242),
-	Color3.fromRGB(148, 154, 170)
-)
-fillGradient.Parent = spiritFill
-
--- "held / cap" text, centered over the bar. White with a strong stroke so it stays
--- readable over both the dark empty track and the light silver fill.
-local spiritText = Instance.new("TextLabel")
-spiritText.Name = "Text"
-spiritText.Size = UDim2.fromScale(1, 1)
-spiritText.BackgroundTransparency = 1
-spiritText.Font = FONT
-spiritText.TextScaled = true
-spiritText.Text = "0 / 1,000"
-spiritText.TextColor3 = Color3.fromRGB(245, 247, 250)
-spiritText.TextStrokeTransparency = 0.35
-spiritText.TextStrokeColor3 = Color3.fromRGB(28, 30, 40)
-spiritText.ZIndex = 2
-spiritText.Parent = spiritBar
-
-local spiritTextPad = Instance.new("UIPadding")
-spiritTextPad.PaddingTop = UDim.new(0, 8)
-spiritTextPad.PaddingBottom = UDim.new(0, 8)
-spiritTextPad.Parent = spiritText
-
-local spiritCap = Instance.new("UITextSizeConstraint")
-spiritCap.MaxTextSize = 24
-spiritCap.Parent = spiritText
-
--- (3) Chi bank COUNTER. A distinct jade pill (Spirit Power = silver, Chi = jade)
--- so the two currencies never read as the same thing. This is the spendable bank.
-local chiCounter = Instance.new("Frame")
-chiCounter.Name = "ChiCounter"
-chiCounter.LayoutOrder = 3
-chiCounter.Size = UDim2.fromOffset(220, 36)
-chiCounter.BackgroundColor3 = Color3.fromRGB(30, 56, 48) -- deep jade
-chiCounter.Parent = hudStack
-round(chiCounter, 12)
-stroke(chiCounter, Color3.fromRGB(90, 210, 160), 2) -- jade-green rim
-
-local chiLabel = Instance.new("TextLabel")
-chiLabel.Name = "Text"
-chiLabel.Size = UDim2.fromScale(1, 1)
-chiLabel.BackgroundTransparency = 1
-chiLabel.Font = FONT
-chiLabel.TextScaled = true
-chiLabel.Text = "0 Chi"
-chiLabel.TextColor3 = Color3.fromRGB(150, 240, 200) -- jade
-chiLabel.TextStrokeTransparency = 0.5
-chiLabel.TextStrokeColor3 = Color3.fromRGB(12, 28, 22)
-chiLabel.Parent = chiCounter
-
-local chiTextPad = Instance.new("UIPadding")
-chiTextPad.PaddingTop = UDim.new(0, 6)
-chiTextPad.PaddingBottom = UDim.new(0, 6)
-chiTextPad.Parent = chiLabel
-
-local chiCap = Instance.new("UITextSizeConstraint")
-chiCap.MaxTextSize = 22
-chiCap.Parent = chiLabel
+-- THE STATE — the single source of truth the pills + rank read from. The update
+-- functions further down push the server-driven values into these.
+local spiritHeld = scope:Value(0) -- current Spirit Power held
+local spiritCap = scope:Value(1000) -- current Soul Jar capacity (held fills toward this)
+local chiAmount = scope:Value(0) -- spendable Chi bank
+local ascendCount = scope:Value(0) -- ascension count → drives rank title + color
 
 -- Current Soul Jar capacity, kept in sync from the server; the bar fills toward it.
--- Defaults to the Clay Jar until the server reports in.
+-- Defaults to the Clay Jar until the server reports in. (renderSoulJar writes this,
+-- then calls updateHudSpirit, which mirrors it into the spiritCap Value above.)
 local currentJarCapacity = 1000
 
+-- Derived display state.
+local spiritFillSize = scope:Computed(function(use)
+	local cap = use(spiritCap)
+	local frac = cap > 0 and math.clamp(use(spiritHeld) / cap, 0, 1) or 0
+	return UDim2.new(frac, 0, 1, 0)
+end)
+local spiritDisplay = scope:Computed(function(use)
+	-- Abbreviated held / cap, e.g. "10M / 10M" — short enough to never overflow the pill.
+	return abbreviate(use(spiritHeld)) .. " / " .. abbreviate(use(spiritCap))
+end)
+local chiDisplay = scope:Computed(function(use)
+	return abbreviate(use(chiAmount))
+end)
+local rankTitle = scope:Computed(function(use)
+	return getRankTitle(use(ascendCount))
+end)
+local rankColor = scope:Computed(function(use)
+	return getRankColor(use(ascendCount))
+end)
+
+-- Pill geometry. Capsule = corner radius == half the height.
+local PILL_W, PILL_H = 250, 52
+local PILL_RADIUS = math.floor(PILL_H / 2)
+
+-- A small placeholder icon badge for a pill. It's a circular chip with an emoji
+-- glyph standing in for art — swap `glyph` for an ImageLabel once real icons exist.
+local function iconBadge(bgColor, ringColor, glyph)
+	return scope:New "Frame" {
+		Name = "Icon",
+		AnchorPoint = Vector2.new(0, 0.5),
+		Position = UDim2.new(0, 6, 0.5, 0),
+		Size = UDim2.fromOffset(PILL_H - 14, PILL_H - 14),
+		BackgroundColor3 = bgColor,
+		ZIndex = 3,
+		[Children] = {
+			scope:New "UICorner" { CornerRadius = UDim.new(1, 0) },
+			scope:New "UIStroke" { Color = OUTLINE, Thickness = 3 },
+			scope:New "TextLabel" {
+				Size = UDim2.fromScale(1, 1),
+				BackgroundTransparency = 1,
+				Font = FONT,
+				Text = glyph,
+				TextScaled = true,
+				TextColor3 = ringColor,
+				ZIndex = 3,
+				[Children] = {
+					scope:New "UIPadding" {
+						PaddingTop = UDim.new(0, 4),
+						PaddingBottom = UDim.new(0, 4),
+						PaddingLeft = UDim.new(0, 4),
+						PaddingRight = UDim.new(0, 4),
+					},
+				},
+			},
+		},
+	}
+end
+
+-- A chunky outlined number that sits over a pill. `colorArg` may be a Color3 or a
+-- reactive Computed of Color3 (drives the gloss gradient).
+local function pillNumber(textState, colorArg)
+	return scope:New "TextLabel" {
+		Name = "Value",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Font = FONT,
+		Text = textState,
+		TextScaled = true,
+		TextColor3 = Color3.new(1, 1, 1), -- white base so the gradient shows true
+		TextXAlignment = Enum.TextXAlignment.Center,
+		ZIndex = 3,
+		[Children] = {
+			-- Left padding clears the icon badge; right padding keeps the number off the rim.
+			scope:New "UIPadding" {
+				PaddingTop = UDim.new(0, 7),
+				PaddingBottom = UDim.new(0, 7),
+				PaddingLeft = UDim.new(0, PILL_H),
+				PaddingRight = UDim.new(0, 14),
+			},
+			scope:New "UITextSizeConstraint" { MaxTextSize = 26 },
+			scope:New "UIStroke" {
+				Color = OUTLINE,
+				Thickness = 3,
+				LineJoinMode = Enum.LineJoinMode.Round,
+			},
+			scope:New "UIGradient" {
+				Rotation = 90,
+				Color = scope:Computed(function(use)
+					return candyGradient(use(colorArg))
+				end),
+			},
+		},
+	}
+end
+
+-- (1) SPIRIT POWER pill — a capsule FILL BAR. A dark track with a silver fill that
+-- grows toward the current Soul Jar capacity, the "held / cap" number on top, and a
+-- silver icon chip. Silver/grey theme. ClipsDescendants keeps the rounded fill tidy.
+local function spiritPill(order)
+	return scope:New "Frame" {
+		Name = "SpiritPill",
+		LayoutOrder = order,
+		Size = UDim2.fromOffset(PILL_W, PILL_H),
+		BackgroundColor3 = Color3.fromRGB(38, 40, 52), -- dark track behind the fill
+		ClipsDescendants = true,
+		[Children] = {
+			scope:New "UICorner" { CornerRadius = UDim.new(0, PILL_RADIUS) },
+			scope:New "UIStroke" { Color = OUTLINE, Thickness = 3 }, -- thick dark outline
+			-- The silver fill (width scales 0..1 with held/cap).
+			scope:New "Frame" {
+				Name = "Fill",
+				AnchorPoint = Vector2.new(0, 0.5),
+				Position = UDim2.fromScale(0, 0.5),
+				Size = spiritFillSize,
+				BackgroundColor3 = Color3.fromRGB(190, 196, 210), -- silver
+				BorderSizePixel = 0,
+				ZIndex = 2,
+				[Children] = {
+					scope:New "UICorner" { CornerRadius = UDim.new(0, PILL_RADIUS) },
+					scope:New "UIGradient" {
+						Rotation = 90,
+						Color = ColorSequence.new(
+							Color3.fromRGB(228, 232, 242),
+							Color3.fromRGB(148, 154, 170)
+						),
+					},
+				},
+			},
+			iconBadge(Color3.fromRGB(96, 102, 120), Color3.fromRGB(240, 244, 252), "⚡"),
+			pillNumber(spiritDisplay, Color3.fromRGB(225, 230, 240)),
+		},
+	}
+end
+
+-- (2) CHI pill — a simple jade capsule showing the Chi number (no bar). Jade/green
+-- theme to match Chi's identity, with a jade icon chip.
+local function chiPill(order)
+	return scope:New "Frame" {
+		Name = "ChiPill",
+		LayoutOrder = order,
+		Size = UDim2.fromOffset(PILL_W, PILL_H),
+		BackgroundColor3 = Color3.fromRGB(28, 60, 50), -- deep jade
+		[Children] = {
+			scope:New "UICorner" { CornerRadius = UDim.new(0, PILL_RADIUS) },
+			scope:New "UIStroke" { Color = OUTLINE, Thickness = 3 }, -- thick dark outline
+			scope:New "UIGradient" {
+				Rotation = 90,
+				Color = ColorSequence.new(
+					Color3.fromRGB(38, 78, 64),
+					Color3.fromRGB(22, 48, 40)
+				),
+			},
+			iconBadge(Color3.fromRGB(46, 140, 104), Color3.fromRGB(190, 255, 224), "☯"),
+			pillNumber(chiDisplay, Color3.fromRGB(150, 240, 200)),
+		},
+	}
+end
+
+-- The bottom-center rank title, built as a standalone TextLabel so it can be dropped
+-- into the bottom stack below (alongside the Spirit Power bar). LayoutOrder 2 puts it
+-- UNDER the bar. Color-coded by rank via the gloss gradient.
+local function rankTitleLabel(order)
+	return scope:New "TextLabel" {
+		Name = "RankTitle",
+		LayoutOrder = order,
+		Size = UDim2.fromOffset(360, 44),
+		BackgroundTransparency = 1,
+		Font = FONT,
+		Text = rankTitle,
+		TextScaled = true,
+		TextColor3 = Color3.new(1, 1, 1), -- white base so the gradient shows the rank color
+		[Children] = {
+			scope:New "UITextSizeConstraint" { MaxTextSize = 36 },
+			scope:New "UIStroke" {
+				Color = OUTLINE,
+				Thickness = 3,
+				LineJoinMode = Enum.LineJoinMode.Round,
+			},
+			-- The gloss gradient is built from the rank's color, so the title recolors
+			-- itself automatically whenever the player Ascends.
+			scope:New "UIGradient" {
+				Rotation = 90,
+				Color = scope:Computed(function(use)
+					return candyGradient(use(rankColor))
+				end),
+			},
+		},
+	}
+end
+
+-- BUILD: top-left CHI pill. Pushed DOWN from the corner so it clears Roblox's reserved
+-- core UI (the hamburger menu + chat toggle live in the top-left). Leaves room BELOW it
+-- for a future side-menu grid (next slice). The Spirit Power bar moved to bottom-center
+-- (below) because that top-left corner overlapped the Roblox buttons.
+scope:New "ScreenGui" {
+	Name = "CurrencyHUD",
+	Parent = playerGui,
+	ResetOnSpawn = false, -- survive respawns, like the other always-on GUIs
+	IgnoreGuiInset = true,
+	[Children] = {
+		scope:New "Frame" {
+			Name = "Pills",
+			AnchorPoint = Vector2.new(0, 0),
+			Position = UDim2.fromOffset(16, 96), -- pushed down, clear of Roblox's core buttons
+			Size = UDim2.fromOffset(PILL_W, PILL_H),
+			BackgroundTransparency = 1,
+			[Children] = {
+				scope:New "UIListLayout" {
+					FillDirection = Enum.FillDirection.Vertical,
+					SortOrder = Enum.SortOrder.LayoutOrder,
+					HorizontalAlignment = Enum.HorizontalAlignment.Left,
+					Padding = UDim.new(0, 10),
+				},
+				chiPill(1),
+			},
+		},
+	},
+}
+
+-- BUILD: bottom-center stack — Spirit Power bar on TOP, rank title BELOW it. A short
+-- fixed-height column anchored to the bottom-center, sized exactly to its contents so
+-- the two pieces never overlap each other. It's clear of the Worlds button (bottom-left)
+-- and the stats panel (bottom-right), and its frames don't sink input (so clicking still
+-- earns Spirit Power). The Spirit Power bar keeps filling toward the jar capacity.
+local BOTTOM_STACK_PAD = 8
+local BOTTOM_STACK_H = PILL_H + BOTTOM_STACK_PAD + 44 -- bar (52) + gap + rank (44)
+scope:New "ScreenGui" {
+	Name = "BottomHUD",
+	Parent = playerGui,
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	[Children] = {
+		scope:New "Frame" {
+			Name = "BottomStack",
+			AnchorPoint = Vector2.new(0.5, 1),
+			Position = UDim2.new(0.5, 0, 1, -16), -- 16px up from the bottom-center
+			Size = UDim2.fromOffset(360, BOTTOM_STACK_H),
+			BackgroundTransparency = 1,
+			[Children] = {
+				scope:New "UIListLayout" {
+					FillDirection = Enum.FillDirection.Vertical,
+					SortOrder = Enum.SortOrder.LayoutOrder,
+					HorizontalAlignment = Enum.HorizontalAlignment.Center,
+					VerticalAlignment = Enum.VerticalAlignment.Bottom,
+					Padding = UDim.new(0, BOTTOM_STACK_PAD),
+				},
+				spiritPill(1), -- top of the stack
+				rankTitleLabel(2), -- directly below the bar
+			},
+		},
+	},
+}
+
+-- The three update functions keep their old names + call sites, but now just push the
+-- server-driven values into the Fusion state — the pills + rank repaint themselves.
 local function updateHudSpirit()
-	local held = spiritPowerValue.Value
-	local cap = currentJarCapacity
-	-- Fraction of the vessel that's full (guard against a 0/None capacity).
-	local frac = cap > 0 and math.clamp(held / cap, 0, 1) or 0
-	spiritFill.Size = UDim2.fromScale(frac, 1)
-	spiritText.Text = commafy(held) .. " / " .. commafy(cap)
+	spiritHeld:set(spiritPowerValue.Value)
+	spiritCap:set(currentJarCapacity)
 end
 
 local function updateHudChi()
-	chiLabel.Text = commafy(chiValue.Value) .. " Chi"
+	chiAmount:set(chiValue.Value)
 end
 
 local function updateHudRank(count)
-	rankDisplay.Text = getRankTitle(count)
-	rankDisplay.TextColor3 = getRankColor(count)
+	ascendCount:set(count)
 end
 
 -- Chi is read-only on the client: keep the counter in sync whenever the server
