@@ -221,6 +221,15 @@ local getWorldsStateFunc = Instance.new("RemoteFunction")
 getWorldsStateFunc.Name = "GetWorldsState"
 getWorldsStateFunc.Parent = ReplicatedStorage
 
+-- Server → client PUSH for the Fusion "Live Stats Panel" (display-only). The server
+-- fires this with a snapshot of the player's current world stats + Ascend multiplier:
+-- once when the client first asks for it, and again whenever those values change (world
+-- travel / Ascend). The client never sets these — they're server-authoritative. The
+-- client may also FIRE this (no args) to REQUEST its initial snapshot.
+local statsUpdateEvent = Instance.new("RemoteEvent")
+statsUpdateEvent.Name = "StatsUpdate"
+statsUpdateEvent.Parent = ReplicatedStorage
+
 --------------------------------------------------------------------------------
 -- 2. Player progression tables
 --------------------------------------------------------------------------------
@@ -287,6 +296,13 @@ local function syncWorldAttributes(player)
 	player:SetAttribute("WorldAtHub", atHub[player] ~= false)
 	player:SetAttribute("WorldIndex", currentWorld[player] or DEFAULT_WORLD)
 end
+
+-- Forward declaration: pushes the Live Stats Panel snapshot to a client. It's
+-- ASSIGNED later (section 3-LIVE), once getCurrentWorld/getAscendMultiplier exist,
+-- but declared here so setupLeaderstats (above that point) can call it after a
+-- player's saved world/ascend data loads — guaranteeing the panel's first values
+-- are correct even for a returning player who isn't in the starter world.
+local pushStats
 
 --------------------------------------------------------------------------------
 -- 2b. Soul Jar (storage cap) configuration
@@ -509,6 +525,7 @@ local function setupLeaderstats(player)
 	unlockedWorlds[player] = data.UnlockedWorlds
 	atHub[player] = data.AtHub
 	syncWorldAttributes(player) -- publish initial view location for per-player visibility
+	pushStats(player) -- seed the client's Live Stats Panel with the correct loaded values
 
 	-- FIND-OR-CREATE every replicated value (never a blind Instance.new). Combined with the
 	-- guard above this guarantees exactly ONE leaderstats / Spirit Power / Chi per player,
@@ -575,6 +592,40 @@ local ASCEND_MULTIPLIER_PER = 1.5 -- permanent Spirit Power multiplier gained pe
 local function getAscendMultiplier(player)
 	return ASCEND_MULTIPLIER_PER ^ (ascendCount[player] or 0)
 end
+
+--------------------------------------------------------------------------------
+-- 3-LIVE. Live stats push (server → client) for the Fusion "Live Stats Panel"
+--------------------------------------------------------------------------------
+-- The client panel is DISPLAY-ONLY; every value here is server-authoritative. We
+-- snapshot the player's CURRENT world stats (name + per-world conversion rate +
+-- per-world click multiplier, straight from the WORLDS config) plus their Ascend
+-- multiplier, and FireClient it. We push on exactly the moments these can change:
+--   * the client's initial request (when its panel starts listening),
+--   * world travel (travelToWorld / travelToHub),
+--   * Ascend (buyAscendFunc),
+--   * the debug world-switch hook.
+-- The client copies the snapshot into Fusion state objects, which re-render the
+-- panel automatically — no polling, no manual label rewrites.
+local function getStatsSnapshot(player)
+	local world = getCurrentWorld(player) -- falls back to the starter world if unset
+	return {
+		worldName = world.name,
+		conversionRate = world.conversionRate, -- e.g. 0.3 (Spirit Power → Chi)
+		clickMultiplier = world.clickMultiplier, -- this world's click multiplier (config value)
+		ascendMultiplier = getAscendMultiplier(player), -- 1.5 ^ AscendCount
+	}
+end
+
+-- Assigns the forward-declared `pushStats` from section 2.
+function pushStats(player)
+	statsUpdateEvent:FireClient(player, getStatsSnapshot(player))
+end
+
+-- The client fires this (no args) once its Fusion panel is listening, to pull the
+-- first snapshot. We reply by pushing the current stats straight back to it.
+statsUpdateEvent.OnServerEvent:Connect(function(player)
+	pushStats(player)
+end)
 
 -- ALL Spirit Power changes go through this one function, so every gain (clicks
 -- now, auto-clicker later) automatically receives the Ascend multiplier on top
@@ -756,6 +807,7 @@ buyAscendFunc.OnServerInvoke = function(player)
 		spiritPower.Value = 0
 	end
 
+	pushStats(player) -- refresh the Live Stats Panel (Ascend multiplier changed)
 	return getAscendState(player)
 end
 
@@ -943,6 +995,7 @@ _G.DEBUG_setWorld = function(player, index)
 	unlockedWorlds[player] = unlockedWorlds[player] or { [DEFAULT_WORLD] = true }
 	unlockedWorlds[player][index] = true -- unlock it too, so state stays consistent
 	syncWorldAttributes(player) -- keep the replicated visibility attributes in sync
+	pushStats(player) -- refresh the Live Stats Panel (debug world switch)
 	print(string.format(
 		"[DEBUG_setWorld] %s -> world %d (%s), conversionRate = %s",
 		player.Name, index, WORLDS[index].name, tostring(WORLDS[index].conversionRate)
@@ -1240,6 +1293,7 @@ local function travelToWorld(player, index)
 	currentWorld[player] = index
 	atHub[player] = false
 	syncWorldAttributes(player) -- tell every client this player is now in world `index`
+	pushStats(player) -- refresh the Live Stats Panel (rate/click multiplier changed)
 	local char = player.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if hrp then
@@ -1252,6 +1306,7 @@ end
 local function travelToHub(player)
 	atHub[player] = true
 	syncWorldAttributes(player) -- tell every client this player is back in the hub
+	pushStats(player) -- refresh the Live Stats Panel (keeps it in sync after travel)
 	local char = player.Character
 	local hrp = char and char:FindFirstChild("HumanoidRootPart")
 	if hrp then
