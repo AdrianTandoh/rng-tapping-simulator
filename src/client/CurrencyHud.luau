@@ -155,8 +155,10 @@ return function(ctx)
 	end
 
 	-- A chunky outlined number that sits over a pill. `colorArg` may be a Color3 or a
-	-- reactive Computed of Color3 (drives the gloss gradient).
-	local function pillNumber(textState, colorArg)
+	-- reactive Computed of Color3 (drives the gloss gradient). `align` (optional) overrides
+	-- the horizontal text alignment — the Chi display left-aligns so the number hugs its
+	-- icon now that it has no pill behind it.
+	local function pillNumber(textState, colorArg, align)
 		return scope:New "TextLabel" {
 			Name = "Value",
 			Size = UDim2.fromScale(1, 1),
@@ -165,7 +167,7 @@ return function(ctx)
 			Text = textState,
 			TextScaled = true,
 			TextColor3 = Color3.new(1, 1, 1), -- white base so the gradient shows true
-			TextXAlignment = Enum.TextXAlignment.Center,
+			TextXAlignment = align or Enum.TextXAlignment.Center,
 			ZIndex = 3,
 			[Children] = {
 				-- Left padding clears the icon badge; right padding keeps the number off the rim.
@@ -241,26 +243,21 @@ return function(ctx)
 		}
 	end
 
-	-- (2) CHI pill — a simple jade capsule showing the Chi number (no bar). Jade/green
-	-- theme to match Chi's identity, with a jade icon chip.
+	-- (2) CHI display — just the jade icon chip + the chunky outlined number, floating
+	-- freely with NO pill/container behind it (like the click-multiplier element). The
+	-- number's thick dark outline keeps it readable straight over the game world. Stays
+	-- reactive (chiDisplay) and in the same top-left slot.
 	local function chiPill(order)
 		return scope:New "Frame" {
-			Name = "ChiPill",
+			Name = "ChiDisplay",
 			LayoutOrder = order,
 			Size = UDim2.fromOffset(PILL_W, PILL_H),
-			BackgroundColor3 = Color3.fromRGB(28, 60, 50), -- deep jade
+			BackgroundTransparency = 1, -- no pill: icon + number only
 			[Children] = {
-				scope:New "UICorner" { CornerRadius = UDim.new(0, PILL_RADIUS) },
-				scope:New "UIStroke" { Color = OUTLINE, Thickness = 3 }, -- thick dark outline
-				scope:New "UIGradient" {
-					Rotation = 90,
-					Color = ColorSequence.new(
-						Color3.fromRGB(38, 78, 64),
-						Color3.fromRGB(22, 48, 40)
-					),
-				},
 				iconBadge(Color3.fromRGB(46, 140, 104), Color3.fromRGB(190, 255, 224), "☯"),
-				pillNumber(chiDisplay, Color3.fromRGB(150, 240, 200)),
+				-- Left-aligned (with the existing left padding that clears the icon) so the
+				-- number sits right next to the chip instead of floating centered away.
+				pillNumber(chiDisplay, Color3.fromRGB(150, 240, 200), Enum.TextXAlignment.Left),
 			},
 		}
 	end

@@ -20,8 +20,10 @@ return function(ctx)
 
 	local scope = Fusion.scoped(Fusion)
 
-	-- CHUNKY proportions: a fat 72px square with a big 20px corner radius and a 4px outline.
-	local TILE = 72
+	-- CHUNKY proportions: a fat 88px square (was 72 — +8px on every side) with a big 20px
+	-- corner radius and a 4px outline. Everything below (holder, pedestal, surface, hitbox,
+	-- grid cell) is derived from TILE, so this one bump resizes the whole tile.
+	local TILE = 88
 	local TILE_RADIUS = 20
 	local PEDESTAL_DROP = 10 -- how much taller the holder is than the tile, so the base peeks
 
@@ -99,7 +101,9 @@ return function(ctx)
 							color = tileColor,
 							radius = TILE_RADIUS,
 							stroke = 4,
-							padding = 12, -- chunky internal padding around the icon
+							padding = 16, -- chunky internal padding; bumped 12→16 so the icon grows only
+						-- slightly with the bigger tile (icon ≈ TILE−2*padding = 56px, was 48) and
+						-- keeps breathing room instead of filling the whole tile
 							glossFraction = 0.42, -- gloss covers the top ~42%
 							glossBoost = glossSpring,
 							bevel = bevelSpring,
@@ -220,17 +224,19 @@ return function(ctx)
 			scope:New "Frame" {
 				Name = "Grid",
 				AnchorPoint = Vector2.new(0, 0),
-				-- The Chi pill sits at y=96 and is 52 tall (bottom ≈ 148); start below that.
-				-- Layout math: 5 tiles → 3 rows of cell-height 106 with 8px vertical padding ⇒
-				-- grid height 3*106 + 2*8 = 334, spanning y≈162..496 (click mult sits below).
+				-- The Chi display sits at y=96 and is 52 tall (bottom ≈ 148); start below that.
+				-- Layout math with the bigger tiles: cell = 96 wide × 122 tall (TILE+8 ×
+				-- TILE+PEDESTAL_DROP+24); 5 tiles → 3 rows with 6px vertical padding ⇒ grid
+				-- height 3*122 + 2*6 = 378, spanning y≈162..540 — still well within the screen
+				-- (the click multiplier moved to the bottom row, so the left column is shorter).
 				Position = UDim2.fromOffset(16, 162),
-				Size = UDim2.fromOffset(180, 334),
+				Size = UDim2.fromOffset(208, 378),
 				BackgroundTransparency = 1,
 				[Children] = {
 					scope:New "UIGridLayout" {
 						-- Cell = the menuTile's Cell size (icon area + pedestal peek + label).
 						CellSize = UDim2.fromOffset(TILE + 8, TILE + PEDESTAL_DROP + 24),
-						CellPadding = UDim2.fromOffset(16, 8), -- tightened vertical gap so the column stays on-screen
+						CellPadding = UDim2.fromOffset(16, 6), -- tightened vertical gap so the bigger tiles still fit
 						FillDirectionMaxCells = 2, -- 2 columns, then wrap
 						SortOrder = Enum.SortOrder.LayoutOrder,
 						HorizontalAlignment = Enum.HorizontalAlignment.Left,

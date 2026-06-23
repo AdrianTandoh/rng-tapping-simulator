@@ -363,9 +363,11 @@ scope:New "ScreenGui" {
 -- reads the SAME `clickMultiplier` Value as before, via a Computed, so travelling to a
 -- world with a different multiplier still updates it automatically — reactivity preserved.
 --
--- PLACEMENT: the LEFT column, directly UNDER the menu grid. The grid (init.client.luau)
--- spans y≈162..496 at x=16, so we park this at (16, 506). The whole left column — Chi pill,
--- menu grid + Settings, then this — then fits on screen without running off the bottom.
+-- PLACEMENT: bottom-LEFT, vertically lined up with the bottom-center RANK TITLE so the two
+-- read as one intentional bottom row (instead of floating mid-column). The rank lives in
+-- CurrencyHud's BottomStack, whose bottom edge is 16px off the screen bottom; the rank is
+-- the bottom element and 44px tall, so its vertical centre is 16 + 22 = 38px up. We anchor
+-- this element's centre to that same line (AnchorPoint y=0.5, Position y = 1, -38).
 local CLICK_GOLD = Color3.fromRGB(255, 205, 70) -- matches the Spirit Power bar's gold
 
 -- The chunky outlined multiplier text. Text is a Computed off clickMultiplier → stays live.
@@ -403,8 +405,8 @@ scope:New "ScreenGui" {
 		-- and pops in lock-step with the stats panel whenever the multiplier changes.
 		scope:New "Frame" {
 			Name = "Root",
-			AnchorPoint = Vector2.new(0, 0),
-			Position = UDim2.fromOffset(16, 506), -- LEFT column, directly under the menu grid (grid ends ≈496)
+			AnchorPoint = Vector2.new(0, 0.5), -- centre-anchored so it lines up with the rank's centre
+			Position = UDim2.new(0, 16, 1, -38), -- bottom-left, level with the bottom-center rank title
 			Size = UDim2.fromOffset(180, 60),
 			BackgroundTransparency = 1, -- NO container: just the icon + number
 			[Children] = {
