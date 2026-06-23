@@ -235,6 +235,19 @@ local travelBlockedEvent = Instance.new("RemoteEvent")
 travelBlockedEvent.Name = "TravelBlocked"
 travelBlockedEvent.Parent = ReplicatedStorage
 
+-- DAILY LOGIN REWARDS. Client invokes this to read its current daily-reward state (the
+-- reward table + which day is claimable now / claimed / upcoming + cooldown remaining).
+local getDailyRewardStateFunc = Instance.new("RemoteFunction")
+getDailyRewardStateFunc.Name = "GetDailyRewardState"
+getDailyRewardStateFunc.Parent = ReplicatedStorage
+
+-- DAILY LOGIN REWARDS. Client invokes this to claim the available reward. The SERVER is the
+-- sole authority: it validates the cooldown against SERVER time, grants the Chi, advances the
+-- streak, persists, and returns { ok, message, ..., state } either way.
+local claimDailyRewardFunc = Instance.new("RemoteFunction")
+claimDailyRewardFunc.Name = "ClaimDailyReward"
+claimDailyRewardFunc.Parent = ReplicatedStorage
+
 -- Server → client PUSH for the Fusion "Live Stats Panel" (display-only). The server
 -- fires this with a snapshot of the player's current world stats + Ascend multiplier:
 -- once when the client first asks for it, and again whenever those values change (world
@@ -265,6 +278,13 @@ local hasAutoClicker = {}
 -- is the dedicated one-time-claim gate (separate from hasAutoClicker so the bundle
 -- contents can change freely). Missing = not yet claimed (defaults to false).
 local claimedGroupReward = {}
+-- DAILY LOGIN REWARDS (server-authoritative, persisted). lastDailyClaim[player] is the SERVER
+-- os.time() of their last successful claim (0 / absent = never claimed). dailyStreak[player] is
+-- the streak DAY they last claimed up to (0 = none); the next claimable day is derived from it
+-- and LOOPS over the reward table. Both are seeded from saved data in setupLeaderstats and only
+-- ever change inside the daily-reward claim chokepoint (section 3g).
+local lastDailyClaim = {} -- [player] = os.time() of last claim (0 = never)
+local dailyStreak = {} -- [player] = streak day claimed up to (0 = none)
 -- Per-player WORLD state (server-authoritative, persisted). currentWorld[player] is
 -- the index of the world they're currently in (default DEFAULT_WORLD). unlockedWorlds
 -- [player] is a SET of unlocked indices ({ [1] = true, ... }); it always contains the
@@ -396,6 +416,10 @@ local function makeDefaults()
 		JarTier = 0,
 		HasAutoClicker = false,
 		ClaimedGroupReward = false,
+		-- Daily login rewards. A new player has never claimed (timestamp 0) and is on streak 0,
+		-- so their first claim is immediately available and grants Day 1.
+		LastDailyClaim = 0,
+		DailyStreak = 0,
 		Chi = 0, -- second, spendable currency (no cap); starts at 0 for new players
 		-- World state. CurrentWorld is an index; UnlockedWorlds is a SET (the in-memory
 		-- form: { [index] = true }). New players start in / own only the starter world.
@@ -456,6 +480,10 @@ local function loadPlayerData(player)
 		JarTier = tonumber(result.JarTier) or 0,
 		HasAutoClicker = result.HasAutoClicker == true,
 		ClaimedGroupReward = result.ClaimedGroupReward == true,
+		-- Daily login rewards, read defensively. A player saved before these existed has neither
+		-- field, so they default to 0/0 (never claimed, streak 0) — exactly the new-player state.
+		LastDailyClaim = tonumber(result.LastDailyClaim) or 0,
+		DailyStreak = tonumber(result.DailyStreak) or 0,
 		-- Read defensively like the others: a player saved before Chi existed has no
 		-- such field, which reads as 0 (the new-player default), exactly as required.
 		Chi = tonumber(result.Chi) or 0,
@@ -494,6 +522,8 @@ local function savePlayerData(player)
 		JarTier = jarTier[player] or 0,
 		HasAutoClicker = hasAutoClicker[player] == true,
 		ClaimedGroupReward = claimedGroupReward[player] == true,
+		LastDailyClaim = lastDailyClaim[player] or 0,
+		DailyStreak = dailyStreak[player] or 0,
 		Chi = chi and chi.Value or 0,
 		CurrentWorld = currentWorld[player] or DEFAULT_WORLD,
 		UnlockedWorlds = unlockedArray,
@@ -623,6 +653,9 @@ local function setupLeaderstats(player)
 	if data.ClaimedGroupReward then
 		claimedGroupReward[player] = true
 	end
+	-- Seed daily-reward state straight from the save (sanitized in loadPlayerData).
+	lastDailyClaim[player] = data.LastDailyClaim
+	dailyStreak[player] = data.DailyStreak
 	-- Seed world state. data.CurrentWorld is a sanitized index and data.UnlockedWorlds
 	-- is already a SET (built by loadPlayerData / makeDefaults), so assign directly.
 	currentWorld[player] = data.CurrentWorld
@@ -1092,6 +1125,132 @@ convertSpiritToChiFunc.OnServerInvoke = function(player)
 end
 
 --------------------------------------------------------------------------------
+-- 3g. DAILY LOGIN REWARDS (server-authoritative, exploit-resistant)
+--------------------------------------------------------------------------------
+-- A streak of escalating Chi rewards, one claim per ~24h. ALL timing uses SERVER os.time(),
+-- never the client's clock, so a player can't change their device time to claim early.
+--
+-- ░░ REWARD TABLE — EDIT FREELY ░░ One row per streak day, in order. `chi` is the Chi granted
+-- that day; `boost = true` marks a MILESTONE day that ALSO grants a (future) boost. The boost
+-- system doesn't exist yet, so a boost day currently just grants its Chi and LOGS the boost as
+-- a placeholder (see the claim handler's TODO). Add/extend days by adding rows; the streak
+-- LOOPS back to Day 1 after the last row (a repeating weekly cycle), so the table can be any
+-- length. Tune these numbers however you like.
+local DAILY_REWARDS = {
+	{ chi = 500 }, -- Day 1
+	{ chi = 1000 }, -- Day 2
+	{ chi = 2000 }, -- Day 3
+	{ chi = 3500 }, -- Day 4
+	{ chi = 6000 }, -- Day 5
+	{ chi = 10000 }, -- Day 6
+	{ chi = 20000, boost = true }, -- Day 7 — MILESTONE: Chi + placeholder boost (not yet built)
+}
+
+-- Claim cadence. A claim is allowed once this much SERVER time has elapsed since the last one.
+-- "Pause on miss" (gentle): the streak NEVER resets. If a player is away for days, the streak
+-- simply doesn't advance while they're gone; their next valid claim resumes at the next day.
+-- The ~48h "miss" idea from the design needs no separate gate here precisely because we never
+-- reset — being away >48h is indistinguishable from being away 25h: both just advance by 1.
+local DAILY_CLAIM_COOLDOWN = 24 * 60 * 60 -- 24h minimum between claims (in seconds)
+
+-- The day index a player would claim NEXT, derived from their streak and LOOPING over the
+-- table. streak 0 → Day 1; streak 7 (table length) → wraps to Day 1 again; streak 3 → Day 4.
+local function nextDailyDay(player)
+	local streak = dailyStreak[player] or 0
+	return (streak % #DAILY_REWARDS) + 1
+end
+
+-- Whether a claim is allowed right now, plus seconds remaining until it is (0 if claimable).
+-- A player who has never claimed (timestamp 0) can always claim immediately.
+local function dailyClaimStatus(player)
+	local last = lastDailyClaim[player] or 0
+	if last == 0 then
+		return true, 0
+	end
+	local elapsed = os.time() - last -- SERVER time only
+	if elapsed >= DAILY_CLAIM_COOLDOWN then
+		return true, 0
+	end
+	return false, DAILY_CLAIM_COOLDOWN - elapsed
+end
+
+-- The full authoritative snapshot the client renders: the reward table (for display), the
+-- player's streak, which day is claimable next, and the live cooldown. The client trusts this
+-- entirely — it never decides claimability itself.
+local function getDailyState(player)
+	local canClaim, remaining = dailyClaimStatus(player)
+	local days = {}
+	for i, row in ipairs(DAILY_REWARDS) do
+		days[i] = { day = i, chi = row.chi, boost = row.boost == true }
+	end
+	return {
+		days = days, -- the whole table, in order
+		streak = dailyStreak[player] or 0, -- streak day claimed up to (0 = none)
+		nextDay = nextDailyDay(player), -- the day a claim would grant now
+		canClaim = canClaim, -- server's authoritative gate
+		secondsUntilNext = remaining, -- 0 when claimable; else cooldown left
+		cooldown = DAILY_CLAIM_COOLDOWN, -- so the client can show a sensible countdown
+	}
+end
+
+getDailyRewardStateFunc.OnServerInvoke = function(player)
+	return getDailyState(player)
+end
+
+-- THE claim chokepoint — fully validated on the server. Rejects early / double claims using
+-- server time, grants the Chi via the existing grantChi chokepoint, advances + persists the
+-- streak, and returns the new state either way.
+claimDailyRewardFunc.OnServerInvoke = function(player)
+	-- 1. Validate the cooldown against SERVER time. This single check rejects double-claims and
+	--    any client that tries to claim early (changing the device clock has no effect here).
+	local canClaim, remaining = dailyClaimStatus(player)
+	if not canClaim then
+		return {
+			ok = false,
+			message = "Already claimed — come back later for your next reward!",
+			secondsUntilNext = remaining,
+			state = getDailyState(player),
+		}
+	end
+
+	-- 2. Resolve the reward for the day being claimed (loops over the table; never resets).
+	local day = nextDailyDay(player)
+	local reward = DAILY_REWARDS[day]
+
+	-- 3. Grant the Chi portion through the single Chi chokepoint (which also runs the W3 world
+	--    unlock check, keeps the bank uncapped, etc. — consistent with every other Chi source).
+	grantChi(player, reward.chi)
+
+	-- 4. MILESTONE boost is a PLACEHOLDER — the boost system doesn't exist yet. For now we only
+	--    log/mark it and still grant the Chi above. TODO(boost): when the boost system is built,
+	--    grant the real boost here (e.g. a timed Chi/click multiplier) instead of just logging.
+	local boostGranted = false
+	if reward.boost then
+		boostGranted = true
+		print(string.format(
+			"[DailyReward] %s claimed milestone Day %d — BOOST placeholder (Chi granted; boost system TODO).",
+			player.Name, day
+		))
+	end
+
+	-- 5. Commit the authoritative state (advance the streak, stamp the claim time) and persist.
+	--    Backgrounded save (pcall-protected inside savePlayerData) so a slow DataStore write
+	--    doesn't stall the claim response.
+	dailyStreak[player] = day
+	lastDailyClaim[player] = os.time()
+	task.spawn(savePlayerData, player)
+
+	return {
+		ok = true,
+		message = "Day " .. day .. ": +" .. reward.chi .. " Chi!" .. (boostGranted and "  ✦ Boost!" or ""),
+		day = day,
+		chi = reward.chi,
+		boost = boostGranted,
+		state = getDailyState(player),
+	}
+end
+
+--------------------------------------------------------------------------------
 -- 3f-DEBUG. TEMPORARY world-switch hook — REMOVE BEFORE SHIPPING
 --------------------------------------------------------------------------------
 -- There's no in-game travel yet (that's a later slice), so this gives you a way to
@@ -1119,6 +1278,35 @@ _G.DEBUG_setWorld = function(player, index)
 	print(string.format(
 		"[DEBUG_setWorld] %s -> world %d (%s), conversionRate = %s",
 		player.Name, index, WORLDS[index].name, tostring(WORLDS[index].conversionRate)
+	))
+end
+
+-- ⚠️ TEMPORARY DEBUG ONLY — delete before release. Fast-tests the daily-reward TIME logic
+-- without waiting real hours: it BACKDATES the player's last-claim timestamp by `hours` (default
+-- 24), simulating that much time having passed. Because all claim logic uses os.time() deltas,
+-- backdating the stored timestamp is indistinguishable from real elapsed time.
+--
+-- USAGE (Studio command bar, while playing as the server):
+--   _G.DEBUG_dailyAdvance(game.Players.YourName)        -- jump 24h → next claim available
+--   _G.DEBUG_dailyAdvance(game.Players.YourName, 50)    -- jump 50h → simulate a >48h "miss"
+-- Re-open the Daily Rewards popup (or it auto-refreshes) and the claim should be available,
+-- resuming the streak (never resetting). Pass a player whose data has loaded.
+_G.DEBUG_dailyAdvance = function(player, hours)
+	hours = tonumber(hours) or 24
+	if not player then
+		warn("[DEBUG_dailyAdvance] Bad args. Usage: _G.DEBUG_dailyAdvance(player, hours?)")
+		return
+	end
+	-- Backdate from the current stored time (or now, if they've never claimed) so repeated calls
+	-- stack. A never-claimed player is already claimable, so this mainly matters post-claim.
+	local base = lastDailyClaim[player]
+	if base == nil or base == 0 then
+		base = os.time()
+	end
+	lastDailyClaim[player] = base - math.floor(hours * 3600)
+	print(string.format(
+		"[DEBUG_dailyAdvance] %s: simulated %s hours passing (streak day = %d, next claim now available = %s).",
+		player.Name, tostring(hours), dailyStreak[player] or 0, tostring((select(1, dailyClaimStatus(player))))
 	))
 end
 
@@ -1882,6 +2070,8 @@ Players.PlayerRemoving:Connect(function(player)
 	jarTier[player] = nil
 	hasAutoClicker[player] = nil
 	claimedGroupReward[player] = nil
+	lastDailyClaim[player] = nil
+	dailyStreak[player] = nil
 	currentWorld[player] = nil
 	unlockedWorlds[player] = nil
 	atHub[player] = nil

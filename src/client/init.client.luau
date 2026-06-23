@@ -29,6 +29,7 @@ require(script.WorldsMenu)(ctx) -- travel popup (owns openWorlds)
 require(script.Shop)(ctx) -- Spirit Shop: Zen + Soul Jar tabs (owns refreshZen)
 require(script.AscendPopup)(ctx) -- prestige popup
 require(script.GroupRewards)(ctx) -- group-reward popup
+require(script.DailyRewards)(ctx) -- daily login rewards popup (owns openDailyRewards)
 require(script.AltarToast)(ctx) -- altar conversion feedback toast
 require(script.MenuGrid)(ctx) -- left-side icon-tile menu grid
 require(script.WorldVisibility)(ctx) -- per-player world/character rendering

@@ -186,6 +186,11 @@ return function(ctx)
 		{ id = "Worlds", label = "Worlds", image = "rbxassetid://17368164592", color = Color3.fromRGB(70, 135, 205), onClick = function()
 			ctx.services.openWorlds()
 		end },
+		-- Daily login rewards. Reuses the gift/codes icon as a PLACEHOLDER — swap `image` for a
+		-- calendar/daily icon when you have one. Opens the server-authoritative Daily Rewards popup.
+		{ id = "Daily", label = "Daily", image = "rbxassetid://126509665306664", color = Color3.fromRGB(235, 190, 60), onClick = function()
+			ctx.services.openDailyRewards()
+		end },
 		{ id = "Pets", label = "Pets", image = "rbxassetid://16697439085", color = Color3.fromRGB(235, 150, 60), onClick = function()
 			ctx.services.showComingSoon("Pets")
 		end },
@@ -226,9 +231,9 @@ return function(ctx)
 				AnchorPoint = Vector2.new(0, 0),
 				-- The Chi display sits at y=96 and is 52 tall (bottom ≈ 148); start below that.
 				-- Layout math with the bigger tiles: cell = 96 wide × 122 tall (TILE+8 ×
-				-- TILE+PEDESTAL_DROP+24); 5 tiles → 3 rows with 6px vertical padding ⇒ grid
-				-- height 3*122 + 2*6 = 378, spanning y≈162..540 — still well within the screen
-				-- (the click multiplier moved to the bottom row, so the left column is shorter).
+				-- TILE+PEDESTAL_DROP+24); 6 tiles → 3 rows × 2 cols with 6px vertical padding ⇒
+				-- grid height 3*122 + 2*6 = 378, spanning y≈162..540 — still well within the
+				-- screen (the click multiplier moved to the bottom row, so this column fits).
 				Position = UDim2.fromOffset(16, 162),
 				Size = UDim2.fromOffset(208, 378),
 				BackgroundTransparency = 1,

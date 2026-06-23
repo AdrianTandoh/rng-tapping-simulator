@@ -98,6 +98,8 @@ local ctx = {
 	openGroupRewardsEvent = remote("OpenGroupRewards"),
 	getGroupRewardStateFunc = remote("GetGroupRewardState"),
 	claimGroupRewardFunc = remote("ClaimGroupReward"),
+	getDailyRewardStateFunc = remote("GetDailyRewardState"), -- daily login rewards: read state
+	claimDailyRewardFunc = remote("ClaimDailyReward"), -- daily login rewards: claim
 	altarTouchedEvent = remote("AltarTouched"),
 	convertSpiritToChiFunc = remote("ConvertSpiritToChi"),
 
