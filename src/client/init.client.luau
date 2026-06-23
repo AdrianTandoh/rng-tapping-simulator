@@ -34,4 +34,5 @@ require(script.AltarToast)(ctx) -- altar conversion feedback toast
 require(script.MenuGrid)(ctx) -- left-side icon-tile menu grid
 require(script.WorldVisibility)(ctx) -- per-player world/character rendering
 require(script.PortalBarriers)(ctx) -- W3: physical locked-portal barriers (needs WorldsMenu's toast)
+require(script.WandTestButton)(ctx) -- TEMP: throwaway equip/unequip test button (remove with inventory)
 require(script.ClickEarn)(ctx) -- world-click → Spirit Power

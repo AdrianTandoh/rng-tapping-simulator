@@ -100,6 +100,7 @@ local ctx = {
 	claimGroupRewardFunc = remote("ClaimGroupReward"),
 	getDailyRewardStateFunc = remote("GetDailyRewardState"), -- daily login rewards: read state
 	claimDailyRewardFunc = remote("ClaimDailyReward"), -- daily login rewards: claim
+	toggleWandEvent = remote("ToggleWand"), -- cosmetic wand (slice 1): request equip/unequip
 	altarTouchedEvent = remote("AltarTouched"),
 	convertSpiritToChiFunc = remote("ConvertSpiritToChi"),
 

@@ -248,6 +248,13 @@ local claimDailyRewardFunc = Instance.new("RemoteFunction")
 claimDailyRewardFunc.Name = "ClaimDailyReward"
 claimDailyRewardFunc.Parent = ReplicatedStorage
 
+-- COSMETIC WAND (slice 1). Client fires this to REQUEST toggling its placeholder wand on/off.
+-- The SERVER owns the wand entirely (creates/welds/destroys it on the character), so the wand
+-- replicates to everyone; the client only asks. Payload: none (it's a toggle).
+local toggleWandEvent = Instance.new("RemoteEvent")
+toggleWandEvent.Name = "ToggleWand"
+toggleWandEvent.Parent = ReplicatedStorage
+
 -- Server → client PUSH for the Fusion "Live Stats Panel" (display-only). The server
 -- fires this with a snapshot of the player's current world stats + Ascend multiplier:
 -- once when the client first asks for it, and again whenever those values change (world
@@ -2055,6 +2062,164 @@ getWorldsStateFunc.OnServerInvoke = function(player)
 end
 
 --------------------------------------------------------------------------------
+-- 5c. COSMETIC WAND — equip/unequip, server-authoritative (slice 1: ONE placeholder)
+--------------------------------------------------------------------------------
+-- The FIRST cosmetic-wand slice: prove the core equip mechanic with ONE placeholder wand.
+-- The SERVER owns the wand completely — it builds the parts, welds them into the character's
+-- hand, and destroys them — so the wand lives in the character model on the server and Roblox
+-- replicates it to EVERY client (other players see it). Clients only send a toggle request via
+-- ToggleWand; they never create the wand themselves. NOT YET: inventory, buying, rarity,
+-- multiple wands, drops — just this one stand-in.
+
+local WAND_MODEL_NAME = "PlaceholderWand"
+-- Placeholder geometry sizes. A thin elongated "handle" + a small glowing "tip" so it clearly
+-- reads as a wand without any real asset. ░░ A real wand Mesh/MeshPart (asset ID) will REPLACE
+-- this whole buildWandModel body later. ░░
+local WAND_HANDLE_SIZE = Vector3.new(0.25, 2.2, 0.25)
+local WAND_TIP_SIZE = Vector3.new(0.5, 0.5, 0.5)
+-- Where the handle sits relative to the hand's grip point. PLACEHOLDER pose: drops the handle
+-- so the fist grips its lower third and the glowing tip points up/out. Tune freely (or flip the
+-- Y sign if it points the wrong way); a real wand mesh will bring its own grip offset later.
+local WAND_GRIP_C0 = CFrame.new(0, -1, 0)
+
+-- [player] = true while the player has the wand equipped. In-memory only (this throwaway slice
+-- doesn't persist cosmetics); it survives respawns so the wand re-attaches to the new character.
+local equippedWand = {}
+local wandToggleDebounce = {} -- [player] = true briefly, so spam-clicking can't build two wands
+
+-- Build the placeholder wand as an unanchored, massless, non-colliding Model (PrimaryPart =
+-- handle). Massless so it never drags the character's physics; CanCollide off so it can't snag.
+local function buildWandModel()
+	local model = Instance.new("Model")
+	model.Name = WAND_MODEL_NAME
+
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = WAND_HANDLE_SIZE
+	handle.Color = Color3.fromRGB(92, 62, 38)
+	handle.Material = Enum.Material.Wood
+	handle.Anchored = false
+	handle.CanCollide = false
+	handle.Massless = true
+	handle.Parent = model
+
+	-- Small glowing tip welded to the top of the handle (purely cosmetic stand-in).
+	local tip = Instance.new("Part")
+	tip.Name = "Tip"
+	tip.Shape = Enum.PartType.Ball
+	tip.Size = WAND_TIP_SIZE
+	tip.Color = Color3.fromRGB(120, 220, 255)
+	tip.Material = Enum.Material.Neon
+	tip.Anchored = false
+	tip.CanCollide = false
+	tip.Massless = true
+	tip.Parent = model
+
+	-- Weld the tip to the top of the handle with an EXPLICIT C0 offset (not a WeldConstraint):
+	-- C0 fixes tip = handle.CFrame * C0 no matter how the handle is later moved/welded, so we can
+	-- reposition the handle into the hand without disturbing the tip's offset.
+	local tipWeld = Instance.new("Weld")
+	tipWeld.Part0 = handle
+	tipWeld.Part1 = tip
+	tipWeld.C0 = CFrame.new(0, WAND_HANDLE_SIZE.Y / 2 + WAND_TIP_SIZE.Y / 2 - 0.1, 0)
+	tipWeld.Parent = handle
+
+	local glow = Instance.new("PointLight")
+	glow.Color = tip.Color
+	glow.Range = 6
+	glow.Brightness = 2
+	glow.Parent = tip
+
+	model.PrimaryPart = handle
+	return model, handle
+end
+
+-- The character's hand part (R15 first, R6 fallback). Yields briefly for late-loading R15 limbs.
+local function getHandPart(character)
+	return character:FindFirstChild("RightHand") -- R15
+		or character:WaitForChild("RightHand", 5) -- R15, still streaming in on a fresh spawn
+		or character:FindFirstChild("Right Arm") -- R6 fallback
+end
+
+-- Remove any wand currently on the player's character (used by unequip + before re-attaching).
+local function detachWand(player, character)
+	character = character or player.Character
+	if not character then
+		return
+	end
+	local existing = character:FindFirstChild(WAND_MODEL_NAME)
+	if existing then
+		existing:Destroy() -- takes the weld + tip + light with it
+	end
+end
+
+-- Build + weld the wand into the hand. SERVER-side, so it replicates to all clients. Safe to
+-- call repeatedly: it clears any existing wand first. No-ops if the player isn't equipped.
+local function attachWand(player, character)
+	character = character or player.Character
+	if not character or not equippedWand[player] then
+		return
+	end
+	local hand = getHandPart(character)
+	-- Re-check after the possible WaitForChild yield: the player may have unequipped or the
+	-- character may have changed (respawn) while we waited.
+	if not hand or not equippedWand[player] or player.Character ~= character then
+		return
+	end
+
+	detachWand(player, character) -- guarantee a single wand
+
+	local model, handle = buildWandModel()
+	-- Anchor the weld to the hand's grip attachment when present (R15), else a sane fallback.
+	local grip = hand:FindFirstChild("RightGripAttachment")
+	local baseGrip = grip and grip.CFrame or CFrame.new(0, -0.2, 0)
+	local c0 = baseGrip * WAND_GRIP_C0
+	-- Pre-place the handle at the welded pose so there's no one-frame fall before the weld locks.
+	handle.CFrame = hand.CFrame * c0
+	model.Parent = character
+
+	local weld = Instance.new("Weld")
+	weld.Name = "WandWeld"
+	weld.Part0 = hand
+	weld.Part1 = handle
+	weld.C0 = c0
+	weld.Parent = handle
+end
+
+-- Toggle request from the client. The SERVER decides + performs the change (authoritative).
+toggleWandEvent.OnServerEvent:Connect(function(player)
+	if wandToggleDebounce[player] then
+		return -- ignore rapid repeats so we never build two wands at once
+	end
+	wandToggleDebounce[player] = true
+	task.delay(0.3, function()
+		wandToggleDebounce[player] = nil
+	end)
+
+	if equippedWand[player] then
+		equippedWand[player] = nil
+		detachWand(player)
+	else
+		equippedWand[player] = true
+		attachWand(player, player.Character)
+	end
+end)
+
+-- RESPAWN handling: if the wand is equipped, re-attach it to each NEW character. task.spawn so
+-- the getHandPart WaitForChild yield can't block the join/respawn flow.
+local function hookWandRespawn(player)
+	player.CharacterAdded:Connect(function(character)
+		if equippedWand[player] then
+			task.spawn(attachWand, player, character)
+		end
+	end)
+end
+Players.PlayerAdded:Connect(hookWandRespawn)
+for _, player in ipairs(Players:GetPlayers()) do
+	hookWandRespawn(player)
+end
+
+--------------------------------------------------------------------------------
 -- 6. Save on leave + per-player cleanup
 --------------------------------------------------------------------------------
 Players.PlayerRemoving:Connect(function(player)
@@ -2072,6 +2237,8 @@ Players.PlayerRemoving:Connect(function(player)
 	claimedGroupReward[player] = nil
 	lastDailyClaim[player] = nil
 	dailyStreak[player] = nil
+	equippedWand[player] = nil
+	wandToggleDebounce[player] = nil
 	currentWorld[player] = nil
 	unlockedWorlds[player] = nil
 	atHub[player] = nil
