@@ -10,12 +10,25 @@ return function(ctx)
 	local round = ctx.round
 	local stroke = ctx.stroke
 	local FONT = ctx.FONT
+	local TweenService = ctx.TweenService
 	local PopupManager = ctx.PopupManager
 	local playerGui = ctx.playerGui
+	local commafy = ctx.commafy
 	local requestTravelEvent = ctx.requestTravelEvent
 	local getWorldsStateFunc = ctx.getWorldsStateFunc
+	local worldUnlockedEvent = ctx.worldUnlockedEvent -- W3: a world just unlocked
+	local travelBlockedEvent = ctx.travelBlockedEvent -- W3: server refused a locked-world travel
 
 	local WORLDS_ACCENT = Color3.fromRGB(120, 200, 255)
+	local LOCK_COLOR = Color3.fromRGB(150, 160, 180) -- muted slate: locked / requirement text
+	local UNLOCK_COLOR = Color3.fromRGB(255, 215, 120) -- warm gold: "world unlocked!" celebration
+
+	-- W3 requirement label, formatted identically wherever it appears (locked tile + toasts):
+	-- e.g. "Requires 1 Ascend + 5,000 Chi". The numbers are the server's authoritative values.
+	local function requirementText(reqAscend, reqChi)
+		local ascendPart = (reqAscend == 1) and "1 Ascend" or (tostring(reqAscend) .. " Ascends")
+		return "Requires " .. ascendPart .. " + " .. commafy(reqChi) .. " Chi"
+	end
 
 	-- The popup (own ScreenGui, managed by PopupManager like the shop/ascend popups).
 	local worldsGui = Instance.new("ScreenGui")
@@ -105,7 +118,52 @@ return function(ctx)
 	worldsListLayout.Padding = UDim.new(0, 10)
 	worldsListLayout.Parent = worldsList
 
-	-- Build one travel row. `highlight` marks the player's CURRENT location.
+	-- A transient floating toast (own ScreenGui, above the menu) for W3 feedback: a locked
+	-- world's requirement, a refused portal/menu travel, or a "world unlocked!" celebration.
+	-- Fire-and-forget juice, not a PopupManager popup (mirrors the AltarToast pattern).
+	local toastGui = Instance.new("ScreenGui")
+	toastGui.Name = "WorldTravelToast"
+	toastGui.ResetOnSpawn = false
+	toastGui.IgnoreGuiInset = true
+	toastGui.DisplayOrder = 60 -- above the worlds popup
+	toastGui.Parent = playerGui
+
+	local toastLabel = Instance.new("TextLabel")
+	toastLabel.AnchorPoint = Vector2.new(0.5, 0.5)
+	toastLabel.Size = UDim2.fromOffset(600, 64)
+	toastLabel.BackgroundTransparency = 1
+	toastLabel.Font = FONT
+	toastLabel.TextScaled = true
+	toastLabel.TextColor3 = LOCK_COLOR
+	toastLabel.TextStrokeColor3 = Color3.fromRGB(14, 18, 28)
+	toastLabel.TextTransparency = 1
+	toastLabel.TextStrokeTransparency = 1
+	toastLabel.Text = ""
+	toastLabel.Parent = toastGui
+
+	local toastCap = Instance.new("UITextSizeConstraint")
+	toastCap.MaxTextSize = 40
+	toastCap.Parent = toastLabel
+
+	local TOAST_START_Y = 0.4
+	local function showTravelToast(text, color)
+		toastLabel.Text = text
+		toastLabel.TextColor3 = color or LOCK_COLOR
+		toastLabel.Position = UDim2.fromScale(0.5, TOAST_START_Y) -- cancels any in-flight tween
+		toastLabel.TextTransparency = 0
+		toastLabel.TextStrokeTransparency = 0.4
+		TweenService:Create(
+			toastLabel,
+			TweenInfo.new(1.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{
+				Position = UDim2.fromScale(0.5, TOAST_START_Y - 0.07),
+				TextTransparency = 1,
+				TextStrokeTransparency = 1,
+			}
+		):Play()
+	end
+
+	-- Build one UNLOCKED travel row. `highlight` marks the player's CURRENT location.
 	local function makeTravelButton(text, target, highlight)
 		local btn = Instance.new("TextButton")
 		btn.Size = UDim2.new(1, -40, 0, 54)
@@ -124,7 +182,52 @@ return function(ctx)
 		return btn
 	end
 
-	-- Rebuild the list from the server's authoritative world list + current location.
+	-- Build one LOCKED world row: visibly disabled (muted, padlock) and showing the unlock
+	-- requirement. It does NOT request travel — clicking just re-shows the requirement toast.
+	-- (The server would refuse a locked travel anyway; this keeps the UI honest about it.)
+	local function makeLockedButton(world)
+		local btn = Instance.new("TextButton")
+		btn.Size = UDim2.new(1, -40, 0, 54)
+		btn.BackgroundColor3 = Color3.fromRGB(46, 50, 64)
+		btn.Text = ""
+		btn.AutoButtonColor = false
+		btn.ZIndex = 1
+		round(btn, 12)
+		stroke(btn, Color3.fromRGB(70, 76, 92), 1)
+
+		local title = Instance.new("TextLabel")
+		title.BackgroundTransparency = 1
+		title.Size = UDim2.new(1, -20, 0, 26)
+		title.Position = UDim2.fromOffset(10, 6)
+		title.Font = FONT
+		title.TextSize = 18
+		title.Text = "🔒 " .. world.name
+		title.TextColor3 = Color3.fromRGB(205, 210, 225)
+		title.TextXAlignment = Enum.TextXAlignment.Center
+		title.ZIndex = 2
+		title.Parent = btn
+
+		local req = Instance.new("TextLabel")
+		req.BackgroundTransparency = 1
+		req.Size = UDim2.new(1, -20, 0, 18)
+		req.Position = UDim2.new(0, 10, 1, -22)
+		req.Font = FONT
+		req.TextSize = 14
+		req.Text = requirementText(world.reqAscend, world.reqChi)
+		req.TextColor3 = LOCK_COLOR
+		req.TextXAlignment = Enum.TextXAlignment.Center
+		req.ZIndex = 2
+		req.Parent = btn
+
+		btn.Activated:Connect(function()
+			showTravelToast(world.name .. " — " .. requirementText(world.reqAscend, world.reqChi), LOCK_COLOR)
+		end)
+		return btn
+	end
+
+	-- Rebuild the list from the server's authoritative world list + current location. The
+	-- server stamps each world's `unlocked` flag + requirement, so this is purely a render of
+	-- authoritative state — the client never decides what's unlocked.
 	local function refreshWorldsMenu()
 		for _, child in ipairs(worldsList:GetChildren()) do
 			if child:IsA("TextButton") then
@@ -136,16 +239,36 @@ return function(ctx)
 			return
 		end
 		for _, w in ipairs(state.worlds) do
-			local here = (not state.atHub) and state.currentWorld == w.index
-			local b = makeTravelButton((here and "● " or "→ ") .. w.name, w.index, here)
+			local b
+			if w.unlocked then
+				local here = (not state.atHub) and state.currentWorld == w.index
+				b = makeTravelButton((here and "● " or "→ ") .. w.name, w.index, here)
+			else
+				b = makeLockedButton(w)
+			end
 			b.LayoutOrder = w.index
 			b.Parent = worldsList
 		end
-		-- Return-to-hub row (highlighted when you're already in the hub).
+		-- Return-to-hub row (always available; highlighted when you're already in the hub).
 		local hubBtn = makeTravelButton((state.atHub and "● " or "↩ ") .. "Return to Hub", 0, state.atHub)
 		hubBtn.LayoutOrder = 100
 		hubBtn.Parent = worldsList
 	end
+
+	-- W3 REACTIVE UPDATES (server pushes). A world unlocking mid-session refreshes the open
+	-- menu so the row flips from locked → travelable without reopening, and celebrates it.
+	worldUnlockedEvent.OnClientEvent:Connect(function(_index, name)
+		showTravelToast("✦ " .. name .. " unlocked! ✦", UNLOCK_COLOR)
+		if worldsGui.Enabled then
+			refreshWorldsMenu()
+		end
+	end)
+
+	-- A refused travel (walked into a locked portal, or a rejected menu/direct request): show
+	-- the requirement the server sent back.
+	travelBlockedEvent.OnClientEvent:Connect(function(_index, name, reqAscend, reqChi)
+		showTravelToast(name .. " — " .. requirementText(reqAscend, reqChi), LOCK_COLOR)
+	end)
 
 	local function openWorlds()
 		refreshWorldsMenu() -- pull fresh state each open
@@ -158,4 +281,9 @@ return function(ctx)
 
 	-- The left-side menu grid's "Worlds" tile calls this.
 	ctx.services.openWorlds = openWorlds
+
+	-- Shared with PortalBarriers (the physical locked-portal barriers) so menu and portals use
+	-- ONE feedback system — the same toast + the same "Requires X Ascend + Y Chi" formatter.
+	ctx.services.showTravelToast = showTravelToast
+	ctx.services.requirementText = requirementText
 end

@@ -221,6 +221,20 @@ local getWorldsStateFunc = Instance.new("RemoteFunction")
 getWorldsStateFunc.Name = "GetWorldsState"
 getWorldsStateFunc.Parent = ReplicatedStorage
 
+-- W3 UNLOCK GATING. Server → client PUSH fired the moment a world FIRST unlocks for a
+-- player (Ascend + Chi thresholds met simultaneously). Payload: (index, name). The client
+-- uses it to refresh an open Worlds menu reactively and show an "unlocked!" toast.
+local worldUnlockedEvent = Instance.new("RemoteEvent")
+worldUnlockedEvent.Name = "WorldUnlocked"
+worldUnlockedEvent.Parent = ReplicatedStorage
+
+-- W3 UNLOCK GATING. Server → client PUSH fired when the server REJECTS a travel request
+-- to a still-locked world (menu click or walking into a portal). Payload:
+-- (index, name, reqAscend, reqChi) so the client can show the requirement message.
+local travelBlockedEvent = Instance.new("RemoteEvent")
+travelBlockedEvent.Name = "TravelBlocked"
+travelBlockedEvent.Parent = ReplicatedStorage
+
 -- Server → client PUSH for the Fusion "Live Stats Panel" (display-only). The server
 -- fires this with a snapshot of the player's current world stats + Ascend multiplier:
 -- once when the client first asks for it, and again whenever those values change (world
@@ -267,6 +281,27 @@ local atHub = {}
 -- world if the stored index is ever missing/invalid, so callers always get a world.
 local function getCurrentWorld(player)
 	return WORLDS[currentWorld[player] or DEFAULT_WORLD] or WORLDS[DEFAULT_WORLD]
+end
+
+-- W3 UNLOCK GATING — a world's unlock REQUIREMENT (NOT a cost; nothing is ever spent).
+-- A world unlocks the first moment a player has BOTH AscendCount >= ascend AND Chi >= chi
+-- simultaneously. Values come straight from the WORLDS config: unlockAscendRequirement and
+-- unlockChiCost ("Cost" is a legacy field name — W3 reads it as a requirement, never spends
+-- it). The starter world has a 0/0 requirement, so it's always satisfied.
+local function worldUnlockReq(index)
+	local w = WORLDS[index]
+	return (w and w.unlockAscendRequirement) or 0, (w and w.unlockChiCost) or 0
+end
+
+-- Is `index` unlocked for this player? The starter world is ALWAYS unlocked; every other
+-- world is unlocked iff it's present in the player's persisted unlockedWorlds set. Defensive
+-- against a missing set (treats it as "only the starter is unlocked").
+local function isWorldUnlocked(player, index)
+	if index == DEFAULT_WORLD then
+		return true
+	end
+	local set = unlockedWorlds[player]
+	return set ~= nil and set[index] == true
 end
 
 -- Where to place this player's character on spawn: the hub, or their current world.
@@ -488,6 +523,75 @@ local function savePlayerData(player)
 end
 
 --------------------------------------------------------------------------------
+-- 2c-W3. World unlock evaluation (server-authoritative, permanent)
+--------------------------------------------------------------------------------
+-- The single chokepoint that decides whether any world should unlock for a player RIGHT
+-- NOW. It reads the authoritative live values (AscendCount + the player's Chi IntValue) and,
+-- for every world not yet unlocked, unlocks it the FIRST moment BOTH thresholds are met
+-- simultaneously. Unlocking is PERMANENT: we only ever ADD to the set, never remove — so a
+-- world stays unlocked through Ascends, Chi dropping back below the threshold, and rejoins.
+--
+-- Call this anywhere Chi or AscendCount can change (Chi gains route through grantChi; Ascend
+-- through buyAscendFunc) and once at join after the saved values are seeded. When something
+-- newly unlocks we persist immediately (so the unlock survives a crash before the leave-save)
+-- and PUSH each new unlock to the client for a reactive menu refresh + toast. Saving in the
+-- background (task.spawn) keeps this off the hot path of whatever gameplay call triggered it.
+local function checkWorldUnlocks(player)
+	local set = unlockedWorlds[player]
+	if not set then
+		return -- player not set up yet / already cleaned up
+	end
+
+	local chi = player:FindFirstChild("Chi")
+	local heldChi = chi and chi.Value or 0
+	local count = ascendCount[player] or 0
+
+	local newlyUnlocked = {}
+	for index in pairs(WORLDS) do
+		if not set[index] then
+			local reqAscend, reqChi = worldUnlockReq(index)
+			if count >= reqAscend and heldChi >= reqChi then
+				set[index] = true -- PERMANENT: only ever added, never removed
+				table.insert(newlyUnlocked, index)
+			end
+		end
+	end
+
+	if #newlyUnlocked == 0 then
+		return
+	end
+
+	-- Persist the new unlock(s) right away (pcall-protected inside savePlayerData, and
+	-- skipped automatically if this session's data didn't load cleanly). Backgrounded so a
+	-- slow DataStore write never stalls the gameplay call that triggered the unlock.
+	task.spawn(savePlayerData, player)
+
+	-- Notify the client in a stable order (sorted) so the menu/toasts are deterministic.
+	table.sort(newlyUnlocked)
+	for _, index in ipairs(newlyUnlocked) do
+		worldUnlockedEvent:FireClient(player, index, WORLDS[index].name)
+	end
+end
+
+-- SPAWN SAFETY (W3) — a player must NEVER spawn or stand inside a world they haven't unlocked.
+-- This guards against leftover / invalid saved state (e.g. a currentWorld saved before gating
+-- existed, or an old test save). If the player's current world isn't unlocked for them, snap
+-- them back to the always-safe starter world (Tranquil Grove) in the neutral Hub. A world that
+-- IS unlocked is left untouched, so a legitimate in-world respawn still returns them to it.
+-- Called on join AND on every respawn (see setupLeaderstats), so the invalid state can never
+-- survive to put a character on locked ground.
+local function ensureSafeLocation(player)
+	local idx = currentWorld[player] or DEFAULT_WORLD
+	if isWorldUnlocked(player, idx) then
+		return -- current world is unlocked (or it's the starter): already safe
+	end
+	currentWorld[player] = DEFAULT_WORLD -- starter world: always unlocked
+	atHub[player] = true -- drop them in the neutral hub, never inside a locked world
+	syncWorldAttributes(player) -- republish view location for per-player visibility
+	pushStats(player) -- refresh the Live Stats Panel (world changed)
+end
+
+--------------------------------------------------------------------------------
 -- 2d. Player join: load data, then build leaderstats
 --------------------------------------------------------------------------------
 -- Roblox shows any IntValue inside a "leaderstats" folder on the leaderboard.
@@ -560,10 +664,20 @@ local function setupLeaderstats(player)
 	end
 	chi.Value = data.Chi
 
+	-- Re-evaluate unlocks now that AscendCount + Chi are seeded from the save. For a normal
+	-- returning player whose worlds are already in the saved set this is a no-op; it only acts
+	-- as a safety net (e.g. a player who already meets a threshold but predates this gate).
+	checkWorldUnlocks(player)
+
+	-- SPAWN SAFETY: validate the loaded location against unlocks BEFORE placing the character,
+	-- so a locked currentWorld (e.g. an old test save) snaps back to the Hub/starter world.
+	ensureSafeLocation(player)
+
 	-- Now that this player's saved location is known, place their character in the right
 	-- area (hub or their world) — both for the current character and every future respawn.
 	-- Connecting here (after the load) guarantees spawnCFrameFor reads valid state.
 	player.CharacterAdded:Connect(function(character)
+		ensureSafeLocation(player) -- re-validate on EVERY respawn (never respawn on locked ground)
 		placeCharacter(player, character)
 	end)
 	if player.Character then
@@ -662,6 +776,8 @@ local function grantChi(player, amount)
 	local chi = player:FindFirstChild("Chi")
 	if chi then
 		chi.Value += amount -- no cap: Chi is the spendable bank
+		-- Chi just rose: a world may now meet its (Ascend + Chi) unlock threshold (W3).
+		checkWorldUnlocks(player)
 	end
 end
 
@@ -808,6 +924,10 @@ buyAscendFunc.OnServerInvoke = function(player)
 	end
 
 	pushStats(player) -- refresh the Live Stats Panel (Ascend multiplier changed)
+	-- AscendCount just rose: re-evaluate unlocks. (Ascend empties Chi to 0, so this won't
+	-- unlock anything on its own — Chi must climb back up via the altar — but we check on
+	-- every AscendCount change for correctness, per the W3 gate's "whenever it changes" rule.)
+	checkWorldUnlocks(player)
 	return getAscendState(player)
 end
 
@@ -1268,8 +1388,8 @@ createMonumentPad({
 --------------------------------------------------------------------------------
 -- Travel is SERVER-AUTHORITATIVE: the server sets currentWorld/atHub and teleports the
 -- character. Both portals (walked into) and the HUD "Worlds" menu funnel through the
--- same travelToWorld/travelToHub below. W2a allows travel to ANY world regardless of
--- unlock status; the unlock GATING arrives in slice W3 (see TODOs).
+-- same travelToWorld/travelToHub below. travelToWorld enforces the W3 unlock GATE (it
+-- refuses locked worlds and returns false), so both paths are gated by one check.
 
 -- Brief per-player cooldown so arriving on top of a portal can't instantly re-trigger it.
 local travelDebounce = {} -- [player] = true for a moment after any travel
@@ -1285,11 +1405,17 @@ local function canTravel(player)
 end
 
 -- Move a player INTO a world: set state (server owns it) then teleport their body.
+-- W3 GATE: this is server-authoritative and the SINGLE place travel actually happens, so the
+-- unlock check here protects BOTH paths (menu request + physical portal) at once — even if a
+-- client bypasses the menu/portal UI, an unlocked-world check it can't satisfy stops it here.
+-- Returns true on success, false if the world is invalid or still LOCKED for this player.
 local function travelToWorld(player, index)
 	if not WORLDS[index] then
-		return
+		return false
 	end
-	-- TODO(W3): restrict to unlockedWorlds[player][index]; W2a intentionally allows all.
+	if not isWorldUnlocked(player, index) then
+		return false -- locked: server refuses (the caller surfaces the requirement to the client)
+	end
 	currentWorld[player] = index
 	atHub[player] = false
 	syncWorldAttributes(player) -- tell every client this player is now in world `index`
@@ -1299,6 +1425,19 @@ local function travelToWorld(player, index)
 	if hrp then
 		hrp.CFrame = worldSpawnCFrame(index)
 	end
+	return true
+end
+
+-- Tell a client WHY a travel request to a locked world was refused, sending the requirement
+-- numbers so the client can render the message ("Requires 1 Ascend + 5,000 Chi"). Shared by
+-- the menu-request path and the physical-portal path.
+local function notifyTravelBlocked(player, index)
+	local world = WORLDS[index]
+	if not world then
+		return
+	end
+	local reqAscend, reqChi = worldUnlockReq(index)
+	travelBlockedEvent:FireClient(player, index, world.name, reqAscend, reqChi)
 end
 
 -- Move a player back to the neutral hub. currentWorld is intentionally left as-is, so
@@ -1679,7 +1818,11 @@ for _, def in ipairs(HUB_PORTAL_DEFS) do
 		color = def.color,
 		label = "→ " .. def.name,
 		onEnter = function(plr)
-			travelToWorld(plr, def.index)
+			-- W3 GATE: walking into a locked world's portal does NOT travel; instead the
+			-- player gets a message with the requirement. Once unlocked, the portal just works.
+			if not travelToWorld(plr, def.index) then
+				notifyTravelBlocked(plr, def.index)
+			end
 		end,
 	})
 end
@@ -1692,16 +1835,29 @@ requestTravelEvent.OnServerEvent:Connect(function(player, target)
 	if target == 0 then
 		travelToHub(player)
 	elseif WORLDS[target] then
-		-- TODO(W3): restrict to unlockedWorlds[player][target]; W2a allows all.
-		travelToWorld(player, target)
+		-- W3 GATE: the server is the final authority — even if the client's menu was bypassed
+		-- to request a locked world, travelToWorld refuses it and we reply with the requirement.
+		if not travelToWorld(player, target) then
+			notifyTravelBlocked(player, target)
+		end
 	end
 end)
 
--- Client reads the world list + its current location to render the Worlds menu.
+-- Client reads the world list + its current location to render the Worlds menu. Each world
+-- carries its W3 unlock state: `unlocked` (whether this player may travel there) plus the
+-- requirement numbers (reqAscend / reqChi) so the menu can label locked worlds. This is the
+-- authoritative source the menu trusts — the client never decides unlock state itself.
 getWorldsStateFunc.OnServerInvoke = function(player)
 	local worlds = {}
 	for index, world in ipairs(WORLDS) do
-		table.insert(worlds, { index = index, name = world.name })
+		local reqAscend, reqChi = worldUnlockReq(index)
+		table.insert(worlds, {
+			index = index,
+			name = world.name,
+			unlocked = isWorldUnlocked(player, index),
+			reqAscend = reqAscend,
+			reqChi = reqChi,
+		})
 	end
 	return {
 		atHub = atHub[player] ~= false,
