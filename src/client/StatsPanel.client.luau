@@ -1,8 +1,10 @@
 -- Ancient Spirit Simulator — LIVE STATS PANEL  (this game's FIRST Fusion UI)
 --
--- A small, always-on-screen, DISPLAY-ONLY readout (no buttons, no interaction) that
--- shows two live stats — the current World name and the Click multiplier — and updates
--- itself automatically whenever the server pushes new values (e.g. travelling worlds).
+-- A small, always-on-screen, DISPLAY-ONLY readout (no buttons, no interaction). The
+-- right-side panel now shows just the current World name; the Click multiplier moved to
+-- its own candy badge at the BOTTOM-CENTER (mouse icon + "x5"). BOTH read from the same
+-- reactive Values and update automatically whenever the server pushes (e.g. travelling
+-- worlds gives a different click multiplier).
 --
 -- CARTOONY "Pet Simulator"-style look: huge chunky numbers with a vertical gloss
 -- gradient (a STATIC sheen — no animated streak), thick dark outlines, a per-number
@@ -63,11 +65,12 @@ local peek = Fusion.peek -- reads a state object's current value WITHOUT subscri
 --------------------------------------------------------------------------------
 -- 1. THE FUSION STATE — the single source of truth the panel reads from
 --------------------------------------------------------------------------------
--- This panel shows only TWO stats now (World + Click), so we keep just two reactive
--- Values. They start with harmless placeholders; the first StatsUpdate from the server
--- (we request one at the bottom of this file) fills in the real values. After that,
--- every server push calls `:set()` and the UI follows along automatically. (The server
--- still sends Convert/Ascend in its snapshot — we simply ignore those fields here.)
+-- We keep two reactive Values: worldName (shown in the right-side panel) and
+-- clickMultiplier (shown in the bottom-center badge built in section 5). They start with
+-- harmless placeholders; the first StatsUpdate from the server (we request one at the
+-- bottom of this file) fills in the real values. After that, every server push calls
+-- `:set()` and BOTH UI elements follow along automatically. (The server still sends
+-- Convert/Ascend in its snapshot — we simply ignore those fields here.)
 local worldName = scope:Value("Loading…") -- e.g. "Tranquil Grove"
 local clickMultiplier = scope:Value(1) -- current world's click multiplier, e.g. 1
 
@@ -87,7 +90,6 @@ local WORLD_COLORS = {
 local WORLD_COLOR_FALLBACK = Color3.fromRGB(245, 245, 255)
 
 local OUTLINE = Color3.fromRGB(18, 14, 28) -- the cartoon dark border color
-local CLICK_COLOR = Color3.fromRGB(255, 150, 60) -- punchy orange for the click multiplier
 
 -- Lighten / darken by blending toward white / black (Color3:Lerp does the mixing).
 local function lighten(c, t)
@@ -117,12 +119,6 @@ local worldColor = scope:Computed(function(use)
 	return WORLD_COLORS[use(worldName)] or WORLD_COLOR_FALLBACK
 end)
 
--- "0.3" → "0.3x", "1" → "1x", "1.5" → "1.5x" (trims trailing zeros).
-local function fmtMult(n)
-	local s = string.format("%.2f", n)
-	s = s:gsub("0+$", ""):gsub("%.$", "")
-	return s .. "x"
-end
 
 --------------------------------------------------------------------------------
 -- 3. ANIMATION STATE — scale pulse (Spring + Tween)
@@ -177,7 +173,7 @@ end)
 
 -- Builds ONE big "hero" number with the full cartoony treatment.
 --   valueState — the reactive Value to display.
---   formatFn   — how to render it (identity for text, fmtMult for multipliers).
+--   formatFn   — how to render it (identity for the World name; pass any formatter).
 --   colorArg   — a Color3 OR a reactive Computed of Color3 (drives the gloss gradient).
 -- The text is RIGHT-aligned: this panel hugs the right edge of the screen, so anchoring
 -- every value to the right keeps short and long values lined up and growing LEFTWARD —
@@ -303,8 +299,9 @@ end
 -- readable against anything. The "Root" frame is fully transparent — it exists only to
 -- (a) carry the UIScale pulse, (b) hold the vertical layout, and (c) give the labels a
 -- fixed WIDTH so long values know how much room they have to shrink into (TextScaled).
--- Sized to the content: title (30) + 2 stat blocks (2×74) + list padding (2×6) ≈ 190.
-local PANEL_W, PANEL_H = 300, 196
+-- Sized to the content: title (30) + 1 stat block (74) + list padding (6) ≈ 110, so the
+-- single World stat still hugs the bottom-right corner now that Click has moved out.
+local PANEL_W, PANEL_H = 300, 116
 
 scope:New "ScreenGui" {
 	Name = "LiveStatsPanel",
@@ -324,7 +321,7 @@ scope:New "ScreenGui" {
 				-- The scale-pulse driver for the whole group (breathing × pop).
 				scope:New "UIScale" { Scale = panelScale },
 
-				-- Vertical stack for the title + the two stats, right-aligned to the edge.
+				-- Vertical stack for the title + the World stat, right-aligned to the edge.
 				scope:New "UIListLayout" {
 					FillDirection = Enum.FillDirection.Vertical,
 					SortOrder = Enum.SortOrder.LayoutOrder,
@@ -347,12 +344,90 @@ scope:New "ScreenGui" {
 					},
 				},
 
-				-- Just TWO stats now: World name (recolors to the world's theme on travel)
-				-- and the Click multiplier (fixed orange). Both values stay reactive.
+				-- Just the World name now (recolors to the world's theme on travel). The
+				-- Click multiplier moved to the bottom-center badge (section 5b); both stay
+				-- reactive off the same Values.
 				statBlock(1, "World", worldName, function(v)
 					return v
 				end, worldColor),
-				statBlock(2, "Click", clickMultiplier, fmtMult, CLICK_COLOR),
+			},
+		},
+	},
+}
+
+--------------------------------------------------------------------------------
+-- 5b. CLICK-MULTIPLIER (big mouse icon + number, UNDER THE LEFT MENU — no container)
+--------------------------------------------------------------------------------
+-- The click multiplier is now just a BIG mouse icon next to the multiplier value in big
+-- chunky GOLD text — NO pill/background — so it reads as a bold standalone callout. It
+-- reads the SAME `clickMultiplier` Value as before, via a Computed, so travelling to a
+-- world with a different multiplier still updates it automatically — reactivity preserved.
+--
+-- PLACEMENT: the LEFT column, directly UNDER the menu grid. The grid (init.client.luau)
+-- spans y≈162..496 at x=16, so we park this at (16, 506). The whole left column — Chi pill,
+-- menu grid + Settings, then this — then fits on screen without running off the bottom.
+local CLICK_GOLD = Color3.fromRGB(255, 205, 70) -- matches the Spirit Power bar's gold
+
+-- The chunky outlined multiplier text. Text is a Computed off clickMultiplier → stays live.
+local multiplierText = scope:New "TextLabel" {
+	Name = "Multiplier",
+	AutomaticSize = Enum.AutomaticSize.X, -- width grows to the value ("x5" vs "x100")
+	Size = UDim2.fromScale(0, 1),
+	BackgroundTransparency = 1,
+	Font = FONT,
+	-- Render as "x5" (prefix ×) to read as "mouse → ×5" next to the icon. Trims trailing
+	-- zeros so 1.5 → "x1.5", 5 → "x5". Reads the same reactive Value the panel used.
+	Text = scope:Computed(function(use)
+		local s = string.format("%.2f", use(clickMultiplier)):gsub("0+$", ""):gsub("%.$", "")
+		return "x" .. s
+	end),
+	TextSize = 44, -- BIG, noticeable chunky number
+	TextColor3 = Color3.new(1, 1, 1), -- white base so the candy gradient shows true color
+	TextYAlignment = Enum.TextYAlignment.Center,
+	LayoutOrder = 2,
+	[Children] = {
+		scope:New "UIStroke" { Color = OUTLINE, Thickness = 4, LineJoinMode = Enum.LineJoinMode.Round },
+		-- Same static candy gloss as the panel numbers, tinted GOLD to match the Spirit bar.
+		scope:New "UIGradient" { Rotation = 90, Color = candyGradient(CLICK_GOLD) },
+	},
+}
+
+scope:New "ScreenGui" {
+	Name = "ClickMultiplier",
+	Parent = playerGui,
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	[Children] = {
+		-- A transparent row holding the big mouse icon + the big gold multiplier — NO
+		-- background/pill (per the redesign). It carries the shared scale-pulse so it breathes
+		-- and pops in lock-step with the stats panel whenever the multiplier changes.
+		scope:New "Frame" {
+			Name = "Root",
+			AnchorPoint = Vector2.new(0, 0),
+			Position = UDim2.fromOffset(16, 506), -- LEFT column, directly under the menu grid (grid ends ≈496)
+			Size = UDim2.fromOffset(180, 60),
+			BackgroundTransparency = 1, -- NO container: just the icon + number
+			[Children] = {
+				scope:New "UIScale" { Scale = panelScale }, -- shared breathe + pop keeps it lively
+				-- A left-aligned row (no background): the big mouse icon, then the big gold
+				-- multiplier number — laid out by the horizontal list below.
+				scope:New "UIListLayout" {
+					FillDirection = Enum.FillDirection.Horizontal,
+					SortOrder = Enum.SortOrder.LayoutOrder,
+					VerticalAlignment = Enum.VerticalAlignment.Center,
+					HorizontalAlignment = Enum.HorizontalAlignment.Left,
+					Padding = UDim.new(0, 8),
+				},
+				-- Mouse icon (the requested asset). Fit keeps its aspect ratio.
+				scope:New "ImageLabel" {
+					Name = "MouseIcon",
+					Size = UDim2.fromOffset(52, 52), -- BIG mouse icon
+					BackgroundTransparency = 1,
+					Image = "rbxassetid://17260727409",
+					ScaleType = Enum.ScaleType.Fit,
+					LayoutOrder = 1,
+				},
+				multiplierText,
 			},
 		},
 	},
