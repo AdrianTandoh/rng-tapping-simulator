@@ -9,6 +9,7 @@ local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local RunService = game:GetService("RunService") -- Heartbeat for the auto-clicker
+local ServerStorage = game:GetService("ServerStorage") -- holds the cosmetic wand source model (slice 1)
 
 --------------------------------------------------------------------------------
 -- 0. One-time cleanup: strip the stray team-create sample script
@@ -273,6 +274,13 @@ local zenLevel = {} -- [player] = Zen level (starts at 0)
 local ascendCount = {} -- [player] = times Ascended (starts at 0)
 local jarTier = {} -- [player] = Soul Jar tier index (0 = Clay, starts at 0)
 local canSave = {} -- [player] = true ONLY if their data loaded cleanly (see 2c)
+-- SAVE THROTTLING (see 2c). dirty[player] = true when the player's in-memory progress has
+-- diverged from what's persisted; the periodic autosave (section 6b) flushes it. saving[player]
+-- = true while a SetAsync for that player's key is in flight, so two saves of the SAME key can
+-- never run at once (this coalescing is what stops the DataStore "request added to queue"
+-- warning). Both are cleared in the PlayerRemoving cleanup.
+local dirty = {} -- [player] = true if data changed since the last successful save
+local saving = {} -- [player] = true while a save for this player's key is in flight
 -- [player] = true once setup has STARTED for them. Set SYNCHRONOUSLY (before the
 -- yielding DataStore load) so a player can NEVER be set up twice — this is what stops
 -- duplicate leaderstats / Spirit Power / Chi objects, the root of the Chi desync.
@@ -407,6 +415,10 @@ local DATASTORE_NAME = "AncientSpiritData" -- single store
 local DATA_KEY_VERSION = "PlayerData_v1" -- versioned key prefix; bump to migrate
 local SAVE_MAX_ATTEMPTS = 3 -- retry a failing SAVE up to this many times
 local SAVE_RETRY_DELAY = 2 -- seconds to wait between save retries
+-- How often the periodic autosave (section 6b) flushes dirty players. Roblox budgets roughly
+-- 6 + numPlayers DataStore writes per minute PER KEY; one write per player per 60s sits far
+-- under that even with the occasional leave/shutdown write on top, so the queue never fills.
+local AUTOSAVE_INTERVAL = 60 -- seconds between autosave passes
 
 local dataStore = DataStoreService:GetDataStore(DATASTORE_NAME)
 
@@ -502,14 +514,48 @@ local function loadPlayerData(player)
 	}, true
 end
 
+-- Flag that a player's in-memory progress now differs from what's saved. Cheap (just sets a
+-- bool); call it from EVERY chokepoint that changes a saved field. The actual DataStore write
+-- is deferred to the periodic autosave (section 6b), so a thousand rapid changes still cost at
+-- most one write per AUTOSAVE_INTERVAL instead of one write each.
+local function markDirty(player)
+	dirty[player] = true
+end
+
 -- Saves a player's current progress, with simple retries. Skips entirely if the
 -- player's data never loaded cleanly, which protects their real save from being
 -- clobbered by this session's defaults.
-local function savePlayerData(player)
+--
+-- `force` distinguishes the two callers:
+--   * false/nil (the periodic autosave): writes ONLY if the player is dirty, and skips if a
+--     save is already in flight — so unchanged data is never re-written and the same key is
+--     never queued twice. This is the throttling that fixes the "request added to queue" warning.
+--   * true (leave / shutdown): MUST persist the very latest state, so it ignores the dirty
+--     check, but still WAITS for any in-flight autosave to finish first so the two writes don't
+--     collide on the same key.
+local function savePlayerData(player, force)
 	if not canSave[player] then
 		warn("[Save] Skipping save for " .. player.Name .. " — data did not load cleanly this session; protecting existing save.")
 		return
 	end
+
+	-- COALESCE so the same key is never written by two coroutines at once.
+	if force then
+		-- Leave/shutdown: wait out any in-flight autosave, then write the latest below.
+		while saving[player] do
+			task.wait()
+		end
+	else
+		-- Autosave pass: skip if a write is already running, or if nothing changed.
+		if saving[player] or not dirty[player] then
+			return
+		end
+	end
+
+	saving[player] = true
+	-- Clear dirty BEFORE snapshotting: any change that lands during the (yielding) write
+	-- re-marks the player dirty, so the next autosave persists it too — never lost.
+	dirty[player] = false
 
 	local leaderstats = player:FindFirstChild("leaderstats")
 	local spiritPower = leaderstats and leaderstats:FindFirstChild("Spirit Power")
@@ -556,7 +602,10 @@ local function savePlayerData(player)
 		print("[Save] Saved progress for " .. player.Name)
 	else
 		warn("[Save] GAVE UP saving for " .. player.Name .. " after " .. attempt .. " attempts.")
+		dirty[player] = true -- write failed: stay dirty so a later autosave retries this player
 	end
+
+	saving[player] = false
 end
 
 --------------------------------------------------------------------------------
@@ -598,10 +647,12 @@ local function checkWorldUnlocks(player)
 		return
 	end
 
-	-- Persist the new unlock(s) right away (pcall-protected inside savePlayerData, and
-	-- skipped automatically if this session's data didn't load cleanly). Backgrounded so a
-	-- slow DataStore write never stalls the gameplay call that triggered the unlock.
-	task.spawn(savePlayerData, player)
+	-- Mark dirty so the periodic autosave (section 6b) persists the new unlock(s). We no longer
+	-- write immediately on every unlock — that, fired alongside altar converts / leaves, was
+	-- queuing repeated writes to the same key (the "request added to queue" warning). The
+	-- autosave flushes within AUTOSAVE_INTERVAL, and the leave/shutdown saves are a backstop, so
+	-- a new unlock survives all the normal exit paths (only a hard crash in the next ~60s loses it).
+	markDirty(player)
 
 	-- Notify the client in a stable order (sorted) so the menu/toasts are deterministic.
 	table.sort(newlyUnlocked)
@@ -624,6 +675,7 @@ local function ensureSafeLocation(player)
 	end
 	currentWorld[player] = DEFAULT_WORLD -- starter world: always unlocked
 	atHub[player] = true -- drop them in the neutral hub, never inside a locked world
+	markDirty(player) -- location changed: flag for the periodic autosave
 	syncWorldAttributes(player) -- republish view location for per-player visibility
 	pushStats(player) -- refresh the Live Stats Panel (world changed)
 end
@@ -793,6 +845,7 @@ local function grantSpiritPower(player, amount)
 		-- (clicks still register; clicking while full simply wastes the excess).
 		local gain = math.floor(amount * getAscendMultiplier(player))
 		spiritPower.Value = math.min(spiritPower.Value + gain, getSpiritCap(player))
+		markDirty(player) -- Spirit Power changed: flag for the periodic autosave
 	end
 end
 
@@ -816,6 +869,7 @@ local function grantChi(player, amount)
 	local chi = player:FindFirstChild("Chi")
 	if chi then
 		chi.Value += amount -- no cap: Chi is the spendable bank
+		markDirty(player) -- Chi changed: flag for the periodic autosave
 		-- Chi just rose: a world may now meet its (Ascend + Chi) unlock threshold (W3).
 		checkWorldUnlocks(player)
 	end
@@ -832,6 +886,7 @@ local function spendChi(player, amount)
 	local chi = player:FindFirstChild("Chi")
 	if chi and chi.Value >= amount then
 		chi.Value -= amount
+		markDirty(player) -- Chi changed: flag for the periodic autosave
 		return true
 	end
 	return false
@@ -905,6 +960,7 @@ buyZenFunc.OnServerInvoke = function(player)
 
 	-- Paid: increment level. (multiplier = 2^level, cap, scaling all unchanged.)
 	zenLevel[player] = level + 1
+	markDirty(player) -- Zen level changed: flag for the periodic autosave
 	return getZenState(player)
 end
 
@@ -953,6 +1009,7 @@ buyAscendFunc.OnServerInvoke = function(player)
 	spendChi(player, heldChi)
 	zenLevel[player] = 0
 	ascendCount[player] = count + 1
+	markDirty(player) -- Ascend count / Zen reset: flag for the periodic autosave
 
 	-- Spirit Power is NO LONGER the prestige currency (it's just conversion fuel now),
 	-- but we still zero the live bar for a clean slate. JarTier is intentionally NOT
@@ -1015,6 +1072,7 @@ buySoulJarFunc.OnServerInvoke = function(player)
 
 	-- Paid: advance the tier.
 	jarTier[player] = tier + 1
+	markDirty(player) -- Soul Jar tier changed: flag for the periodic autosave
 	return getSoulJarState(player)
 end
 
@@ -1086,6 +1144,7 @@ local function claimGroupReward(player)
 		zenLevel[player] = math.min((zenLevel[player] or 0) + GROUP_REWARD.zenLevels, getZenCap(player))
 	end
 
+	markDirty(player) -- claim flags / auto-clicker / zen changed: flag for the periodic autosave
 	return { ok = true, message = "Reward claimed! Auto-clicker activated.", state = getGroupRewardState(player) }
 end
 
@@ -1240,12 +1299,13 @@ claimDailyRewardFunc.OnServerInvoke = function(player)
 		))
 	end
 
-	-- 5. Commit the authoritative state (advance the streak, stamp the claim time) and persist.
-	--    Backgrounded save (pcall-protected inside savePlayerData) so a slow DataStore write
-	--    doesn't stall the claim response.
+	-- 5. Commit the authoritative state (advance the streak, stamp the claim time) and mark dirty
+	--    so the periodic autosave (section 6b) persists it. We don't write immediately anymore —
+	--    a claim followed quickly by a leave was queuing two writes to the same key. The streak is
+	--    captured by the next autosave and by the guaranteed leave/shutdown save either way.
 	dailyStreak[player] = day
 	lastDailyClaim[player] = os.time()
-	task.spawn(savePlayerData, player)
+	markDirty(player)
 
 	return {
 		ok = true,
@@ -1613,6 +1673,7 @@ local function travelToWorld(player, index)
 	end
 	currentWorld[player] = index
 	atHub[player] = false
+	markDirty(player) -- location changed: flag for the periodic autosave
 	syncWorldAttributes(player) -- tell every client this player is now in world `index`
 	pushStats(player) -- refresh the Live Stats Panel (rate/click multiplier changed)
 	local char = player.Character
@@ -1639,6 +1700,7 @@ end
 -- the altar keeps converting at the rate of the world they were last earning in.
 local function travelToHub(player)
 	atHub[player] = true
+	markDirty(player) -- location changed: flag for the periodic autosave
 	syncWorldAttributes(player) -- tell every client this player is back in the hub
 	pushStats(player) -- refresh the Live Stats Panel (keeps it in sync after travel)
 	local char = player.Character
@@ -2062,76 +2124,153 @@ getWorldsStateFunc.OnServerInvoke = function(player)
 end
 
 --------------------------------------------------------------------------------
--- 5c. COSMETIC WAND — equip/unequip, server-authoritative (slice 1: ONE placeholder)
+-- 5c. COSMETIC WAND — equip/unequip, server-authoritative (slice 1: ONE real wand)
 --------------------------------------------------------------------------------
--- The FIRST cosmetic-wand slice: prove the core equip mechanic with ONE placeholder wand.
--- The SERVER owns the wand completely — it builds the parts, welds them into the character's
--- hand, and destroys them — so the wand lives in the character model on the server and Roblox
--- replicates it to EVERY client (other players see it). Clients only send a toggle request via
--- ToggleWand; they never create the wand themselves. NOT YET: inventory, buying, rarity,
--- multiple wands, drops — just this one stand-in.
+-- The FIRST cosmetic-wand slice: prove the core equip mechanic with ONE real wand.
+-- The SERVER owns the wand completely — it CLONES a placed source model, welds it into the
+-- character's hand, and destroys it — so the wand lives in the character model on the server and
+-- Roblox replicates it to EVERY client (other players see it). Clients only send a toggle request
+-- via ToggleWand; they never create the wand themselves. NOT YET: inventory, buying, rarity,
+-- multiple wands, drops — just this one wand.
+--
+-- SOURCE: a clean, script-free wand Model placed in ServerStorage named "WandModel" (the "Handle"
+-- part is the grip). We load by CLONING that model — NOT by InsertService:LoadAsset, which failed
+-- for this asset with "asset not trusted for this place".
 
-local WAND_MODEL_NAME = "PlaceholderWand"
--- Placeholder geometry sizes. A thin elongated "handle" + a small glowing "tip" so it clearly
--- reads as a wand without any real asset. ░░ A real wand Mesh/MeshPart (asset ID) will REPLACE
--- this whole buildWandModel body later. ░░
-local WAND_HANDLE_SIZE = Vector3.new(0.25, 2.2, 0.25)
-local WAND_TIP_SIZE = Vector3.new(0.5, 0.5, 0.5)
--- Where the handle sits relative to the hand's grip point. PLACEHOLDER pose: drops the handle
--- so the fist grips its lower third and the glowing tip points up/out. Tune freely (or flip the
--- Y sign if it points the wrong way); a real wand mesh will bring its own grip offset later.
-local WAND_GRIP_C0 = CFrame.new(0, -1, 0)
+local WAND_MODEL_NAME = "Wand" -- name of the wand model once welded onto the character
+local SOURCE_MODEL_NAME = "WandModel" -- the source model you placed in ServerStorage
+local GRIP_PART_NAME = "Handle" -- the part inside WandModel that should sit in the fist
+
+-- ╔══════════════════════════════════════════════════════════════════════════╗
+-- ║  WAND FIT — tweak these to change how the wand sits in the hand.           ║
+-- ╠══════════════════════════════════════════════════════════════════════════╣
+-- ║  Start by adjusting WAND_SCALE (too big/small?), then WAND_GRIP_ROTATION   ║
+-- ║  (pointing the wrong way?), then WAND_GRIP_OFFSET (sitting too high/low or  ║
+-- ║  clipping into the arm?). Re-sync Rojo and re-equip after each change.      ║
+-- ╚══════════════════════════════════════════════════════════════════════════╝
+local WAND_SCALE = 1.0 -- uniform size multiplier for the whole wand (raise if tiny, lower if huge)
+-- Rotation of the wand in the hand, in DEGREES. Applied as X (pitch), then Y (yaw), then Z (roll).
+-- If the wand points down the arm or sideways instead of out of the fist, change these (90/180
+-- on one axis usually fixes orientation). e.g. Vector3.new(90, 0, 0) tips it forward.
+local WAND_GRIP_ROTATION = Vector3.new(0, 0, 0)
+-- Position of the wand relative to the hand's grip point, in STUDS (after rotation). Nudge this
+-- if the wand floats away from the palm or clips through the hand/arm. +Y up, +X right, +Z back.
+local WAND_GRIP_OFFSET = Vector3.new(0, 0, 0)
+
+-- The grip transform applied on top of the hand's grip attachment. Built from the tunables above.
+local function wandGripCFrame()
+	local r = WAND_GRIP_ROTATION
+	return CFrame.new(WAND_GRIP_OFFSET)
+		* CFrame.Angles(math.rad(r.X), math.rad(r.Y), math.rad(r.Z))
+end
 
 -- [player] = true while the player has the wand equipped. In-memory only (this throwaway slice
 -- doesn't persist cosmetics); it survives respawns so the wand re-attaches to the new character.
 local equippedWand = {}
 local wandToggleDebounce = {} -- [player] = true briefly, so spam-clicking can't build two wands
 
--- Build the placeholder wand as an unanchored, massless, non-colliding Model (PrimaryPart =
--- handle). Massless so it never drags the character's physics; CanCollide off so it can't snag.
-local function buildWandModel()
-	local model = Instance.new("Model")
+-- The prepared wand template (built once from ServerStorage.WandModel, then cloned per equip).
+-- nil if the source model is missing — attachWand warns instead of silently doing nothing.
+local wandTemplate = nil
+
+-- Find the grip/root part inside the cloned model: prefer the part named GRIP_PART_NAME
+-- ("Handle"), then the model's PrimaryPart, then the largest part as a last resort.
+local function findGripPart(model)
+	local named = model:FindFirstChild(GRIP_PART_NAME, true)
+	if named and named:IsA("BasePart") then
+		return named
+	end
+	if model.PrimaryPart then
+		return model.PrimaryPart
+	end
+	local best, bestVolume = nil, -1
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local v = d.Size.X * d.Size.Y * d.Size.Z
+			if v > bestVolume then
+				best, bestVolume = d, v
+			end
+		end
+	end
+	return best
+end
+
+-- Build the wand template ONCE by CLONING ServerStorage.WandModel and normalizing it into a
+-- clean, hand-ready Model:
+--   • named WAND_MODEL_NAME, with PrimaryPart = the grip part ("Handle")
+--   • every part unanchored + massless + non-colliding (so it can't drag or snag the character)
+--   • every non-grip part welded to the grip, so the whole wand moves as one rigid piece
+--   • scaled by WAND_SCALE
+-- Returns the template Model, or nil + a reason string on failure.
+local function prepareWandTemplate()
+	local source = ServerStorage:FindFirstChild(SOURCE_MODEL_NAME)
+	if not source then
+		return nil, ("ServerStorage.%s not found"):format(SOURCE_MODEL_NAME)
+	end
+
+	local model = source:Clone()
 	model.Name = WAND_MODEL_NAME
 
-	local handle = Instance.new("Part")
-	handle.Name = "Handle"
-	handle.Size = WAND_HANDLE_SIZE
-	handle.Color = Color3.fromRGB(92, 62, 38)
-	handle.Material = Enum.Material.Wood
-	handle.Anchored = false
-	handle.CanCollide = false
-	handle.Massless = true
-	handle.Parent = model
+	-- Drop anything that shouldn't ride along on a cosmetic: existing joints (we re-weld to our
+	-- chosen grip) and any stray scripts (the source should already be script-free).
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("Weld") or d:IsA("WeldConstraint") or d:IsA("Motor6D") or d:IsA("Snap")
+			or d:IsA("BaseScript") then
+			d:Destroy()
+		end
+	end
 
-	-- Small glowing tip welded to the top of the handle (purely cosmetic stand-in).
-	local tip = Instance.new("Part")
-	tip.Name = "Tip"
-	tip.Shape = Enum.PartType.Ball
-	tip.Size = WAND_TIP_SIZE
-	tip.Color = Color3.fromRGB(120, 220, 255)
-	tip.Material = Enum.Material.Neon
-	tip.Anchored = false
-	tip.CanCollide = false
-	tip.Massless = true
-	tip.Parent = model
+	local grip = findGripPart(model)
+	if not grip then
+		model:Destroy()
+		return nil, ("%s contains no parts"):format(SOURCE_MODEL_NAME)
+	end
 
-	-- Weld the tip to the top of the handle with an EXPLICIT C0 offset (not a WeldConstraint):
-	-- C0 fixes tip = handle.CFrame * C0 no matter how the handle is later moved/welded, so we can
-	-- reposition the handle into the hand without disturbing the tip's offset.
-	local tipWeld = Instance.new("Weld")
-	tipWeld.Part0 = handle
-	tipWeld.Part1 = tip
-	tipWeld.C0 = CFrame.new(0, WAND_HANDLE_SIZE.Y / 2 + WAND_TIP_SIZE.Y / 2 - 0.1, 0)
-	tipWeld.Parent = handle
+	-- Make every part safe to wear, then weld each non-grip part to the grip (reparenting/cloning
+	-- preserves world CFrame, so the model stays assembled while we re-weld it).
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			d.Anchored = false
+			d.CanCollide = false
+			d.Massless = true
+			if d ~= grip then
+				local w = Instance.new("Weld")
+				w.Part0 = grip
+				w.Part1 = d
+				w.C0 = grip.CFrame:ToObjectSpace(d.CFrame) -- lock current relative pose
+				w.Parent = grip
+			end
+		end
+	end
+	model.PrimaryPart = grip
 
-	local glow = Instance.new("PointLight")
-	glow.Color = tip.Color
-	glow.Range = 6
-	glow.Brightness = 2
-	glow.Parent = tip
+	if WAND_SCALE ~= 1 then
+		model:ScaleTo(WAND_SCALE) -- scales parts, meshes, and our weld offsets together
+	end
+	return model, nil
+end
 
-	model.PrimaryPart = handle
-	return model, handle
+-- Clone the prepared template for one equip. Returns model, grip — or nil if the source is missing.
+local function buildWandModel()
+	if not wandTemplate then
+		return nil, nil
+	end
+	local model = wandTemplate:Clone()
+	return model, model.PrimaryPart
+end
+
+-- Prepare the template ONCE at startup. If the source model is missing, log a clear message so
+-- it's obvious the WandModel needs to be placed (rather than equipping silently doing nothing).
+do
+	local model, reason = prepareWandTemplate()
+	if model then
+		wandTemplate = model
+		print(("[Wand] Prepared wand from ServerStorage.%s."):format(SOURCE_MODEL_NAME))
+	else
+		warn(("[Wand] %s — place a clean, script-free wand Model in ServerStorage named '%s' "
+			.. "(with the grip part named '%s'). Equipping will no-op until it exists."):format(
+			reason, SOURCE_MODEL_NAME, GRIP_PART_NAME))
+	end
 end
 
 -- The character's hand part (R15 first, R6 fallback). Yields briefly for late-loading R15 limbs.
@@ -2167,23 +2306,32 @@ local function attachWand(player, character)
 		return
 	end
 
+	local model, root = buildWandModel()
+	if not model then
+		-- Template was never built — the source model is missing. We warned once at startup;
+		-- warn here too so it's obvious on equip rather than failing silently.
+		warn(("[Wand] Cannot equip for %s — ServerStorage.%s is missing (see startup warning)."):format(
+			player.Name, SOURCE_MODEL_NAME))
+		return
+	end
+
 	detachWand(player, character) -- guarantee a single wand
 
-	local model, handle = buildWandModel()
 	-- Anchor the weld to the hand's grip attachment when present (R15), else a sane fallback.
 	local grip = hand:FindFirstChild("RightGripAttachment")
 	local baseGrip = grip and grip.CFrame or CFrame.new(0, -0.2, 0)
-	local c0 = baseGrip * WAND_GRIP_C0
-	-- Pre-place the handle at the welded pose so there's no one-frame fall before the weld locks.
-	handle.CFrame = hand.CFrame * c0
+	local c0 = baseGrip * wandGripCFrame()
+	-- Pre-place the whole wand at the welded pose (PivotTo moves PrimaryPart + welded parts as one)
+	-- so there's no one-frame fall before the weld locks.
+	model:PivotTo(hand.CFrame * c0)
 	model.Parent = character
 
 	local weld = Instance.new("Weld")
 	weld.Name = "WandWeld"
 	weld.Part0 = hand
-	weld.Part1 = handle
+	weld.Part1 = root
 	weld.C0 = c0
-	weld.Parent = handle
+	weld.Parent = root
 end
 
 -- Toggle request from the client. The SERVER decides + performs the change (authoritative).
@@ -2220,11 +2368,37 @@ for _, player in ipairs(Players:GetPlayers()) do
 end
 
 --------------------------------------------------------------------------------
+-- 6b. Periodic autosave (the throttle that fixes the DataStore queue warning)
+--------------------------------------------------------------------------------
+-- Saves used to fire on individual data-change events (every world unlock, every daily claim),
+-- which — clustered with the leave/shutdown saves — wrote the SAME key repeatedly within a few
+-- seconds and filled Roblox's per-key DataStore request queue ("request added to queue"
+-- warning), risking dropped saves. Now changes only set a dirty flag (markDirty); this single
+-- loop is the ONLY periodic writer. Every AUTOSAVE_INTERVAL it flushes each dirty player exactly
+-- once (savePlayerData skips clean players and coalesces in-flight writes), keeping each key far
+-- under the ~6 + numPlayers writes/min budget. Leave + shutdown saves remain as guaranteed
+-- backstops, so nothing earned between ticks is ever lost.
+task.spawn(function()
+	while true do
+		task.wait(AUTOSAVE_INTERVAL)
+		for _, player in ipairs(Players:GetPlayers()) do
+			if dirty[player] then
+				-- Per-player spawn: one slow write never delays the others, and each is a
+				-- DIFFERENT key so they don't contend with each other's rate budget.
+				task.spawn(savePlayerData, player) -- non-forced: writes only if still dirty
+			end
+		end
+	end
+end)
+
+--------------------------------------------------------------------------------
 -- 6. Save on leave + per-player cleanup
 --------------------------------------------------------------------------------
 Players.PlayerRemoving:Connect(function(player)
-	-- Save BEFORE clearing the tables that savePlayerData reads from.
-	savePlayerData(player)
+	-- Save BEFORE clearing the tables that savePlayerData reads from. force=true: always persist
+	-- the very latest state on leave (ignores the dirty check), so a player who earned Chi then
+	-- left immediately still has it saved — it just waits out any in-flight autosave first.
+	savePlayerData(player, true)
 
 	lastClickTime[player] = nil
 	for _, debounce in ipairs(padDebounces) do
@@ -2244,6 +2418,8 @@ Players.PlayerRemoving:Connect(function(player)
 	atHub[player] = nil
 	travelDebounce[player] = nil
 	canSave[player] = nil
+	dirty[player] = nil
+	saving[player] = nil
 	initialized[player] = nil -- allow a clean re-setup if this player rejoins
 end)
 
@@ -2261,7 +2437,7 @@ game:BindToClose(function()
 
 	for _, player in ipairs(players) do
 		task.spawn(function()
-			savePlayerData(player)
+			savePlayerData(player, true) -- force: persist the latest state for everyone on shutdown
 			remaining -= 1
 		end)
 	end
