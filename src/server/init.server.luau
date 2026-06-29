@@ -700,6 +700,15 @@ local function setupLeaderstats(player)
 
 	-- Load first so everything is seeded from saved progress (or defaults).
 	local data, loadOk = loadPlayerData(player)
+	-- The load above YIELDS (GetAsync). If the player disconnected during that yield,
+	-- PlayerRemoving has already run its leave-save (correctly skipped, since canSave was
+	-- still nil) and cleared this player's tables + reset initialized. Resuming here would
+	-- re-seed those tables and build leaderstats on a departed player — a harmless memory
+	-- leak (no save is triggered, and the autosave loop only iterates current players, so
+	-- their real data is never touched). Bail out instead of leaving the orphan behind.
+	if not player:IsDescendantOf(Players) then
+		return
+	end
 	canSave[player] = loadOk -- only allow saving if the load was clean
 
 	zenLevel[player] = data.ZenLevel
