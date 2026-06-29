@@ -1327,63 +1327,255 @@ claimDailyRewardFunc.OnServerInvoke = function(player)
 end
 
 --------------------------------------------------------------------------------
--- 3f-DEBUG. TEMPORARY world-switch hook — REMOVE BEFORE SHIPPING
+-- 3f-DEBUG. STUDIO-ONLY testing tools (command-bar helpers)
 --------------------------------------------------------------------------------
--- There's no in-game travel yet (that's a later slice), so this gives you a way to
--- set your current world from the Studio command bar to verify the altar uses the
--- right per-world conversion rate. It ALSO unlocks the target world so currentWorld
--- and unlockedWorlds stay consistent.
+-- A clean, reliable set of debug helpers for fast testing from the Studio command bar.
 --
--- USAGE (Studio command bar, while playing as the server):
---   _G.DEBUG_setWorld(game.Players.YourName, 2)
--- then walk into the Meditation Altar and convert — it should use world 2's rate (0.6).
+-- SAFETY: the ENTIRE block is wrapped in `if RunService:IsStudio()`. In a published /
+-- live server IsStudio() is false, so NONE of these `_G.DEBUG_*` functions are ever
+-- registered — `_G.DEBUG_setChi` etc. are simply nil there, so a player could never
+-- invoke them even if they found a way to run server Lua. (Clients also have their OWN
+-- separate `_G`, so they never see these regardless.)
 --
--- ⚠️ TEMPORARY DEBUG ONLY — delete this whole block before release. It bypasses the
--- (not-yet-built) unlock cost / Ascend requirement checks.
-_G.DEBUG_setWorld = function(player, index)
-	index = tonumber(index)
-	if not player or WORLDS[index] == nil then
-		warn("[DEBUG_setWorld] Bad args. Usage: _G.DEBUG_setWorld(player, validWorldIndex)")
-		return
+-- HOW TO RUN (read this if they've "never worked"):
+--   1. Press PLAY (F5) to start a playtest so the server is actually running.
+--   2. In the command bar, set the context dropdown to **Server** (NOT Client). `_G` is
+--      per-VM: these live in the SERVER's `_G`, so a Client-context command bar sees nil
+--      (the classic "attempt to call a nil value" — the #1 reason they failed before).
+--   3. Call by USERNAME (string), e.g.:  _G.DEBUG_setChi("tanxy_z", 5000)
+--   Run `_G.DEBUG_help()` for the full list.
+--
+-- Every helper resolves the player by name, validates/clamps inputs, routes through the
+-- real chokepoints where it matters (grantChi/spendChi fire world-unlock checks), and
+-- markDirty()s so the change actually persists. Where a value is set DIRECTLY (Spirit
+-- Power, Ascend count, Jar tier), that's intentional for testing and noted inline.
+if RunService:IsStudio() then
+	-- Resolve a debug arg (a username string OR a Player instance) to a Player, or nil.
+	local function resolvePlayer(arg)
+		if typeof(arg) == "Instance" and arg:IsA("Player") then
+			return arg
+		end
+		if type(arg) == "string" then
+			local p = Players:FindFirstChild(arg)
+			if p and p:IsA("Player") then
+				return p
+			end
+			local names = {}
+			for _, pl in ipairs(Players:GetPlayers()) do
+				table.insert(names, pl.Name)
+			end
+			warn(string.format("[DEBUG] No player named %q. In game now: %s", arg, table.concat(names, ", ")))
+			return nil
+		end
+		warn("[DEBUG] First arg must be a username STRING (e.g. \"tanxy_z\") or a Player instance.")
+		return nil
 	end
-	currentWorld[player] = index
-	unlockedWorlds[player] = unlockedWorlds[player] or { [DEFAULT_WORLD] = true }
-	unlockedWorlds[player][index] = true -- unlock it too, so state stays consistent
-	syncWorldAttributes(player) -- keep the replicated visibility attributes in sync
-	pushStats(player) -- refresh the Live Stats Panel (debug world switch)
-	print(string.format(
-		"[DEBUG_setWorld] %s -> world %d (%s), conversionRate = %s",
-		player.Name, index, WORLDS[index].name, tostring(WORLDS[index].conversionRate)
-	))
-end
 
--- ⚠️ TEMPORARY DEBUG ONLY — delete before release. Fast-tests the daily-reward TIME logic
--- without waiting real hours: it BACKDATES the player's last-claim timestamp by `hours` (default
--- 24), simulating that much time having passed. Because all claim logic uses os.time() deltas,
--- backdating the stored timestamp is indistinguishable from real elapsed time.
---
--- USAGE (Studio command bar, while playing as the server):
---   _G.DEBUG_dailyAdvance(game.Players.YourName)        -- jump 24h → next claim available
---   _G.DEBUG_dailyAdvance(game.Players.YourName, 50)    -- jump 50h → simulate a >48h "miss"
--- Re-open the Daily Rewards popup (or it auto-refreshes) and the claim should be available,
--- resuming the streak (never resetting). Pass a player whose data has loaded.
-_G.DEBUG_dailyAdvance = function(player, hours)
-	hours = tonumber(hours) or 24
-	if not player then
-		warn("[DEBUG_dailyAdvance] Bad args. Usage: _G.DEBUG_dailyAdvance(player, hours?)")
-		return
+	-- Set Chi to an exact value. Routes the delta through grantChi/spendChi so world-unlock
+	-- checks still fire (grantChi calls checkWorldUnlocks). Clamped to >= 0.
+	_G.DEBUG_setChi = function(nameOrPlayer, value)
+		local player = resolvePlayer(nameOrPlayer)
+		if not player then return end
+		value = math.max(0, math.floor(tonumber(value) or 0))
+		local chi = player:FindFirstChild("Chi")
+		if not chi then
+			warn("[DEBUG_setChi] " .. player.Name .. " has no Chi value yet (data still loading?).")
+			return
+		end
+		if value > chi.Value then
+			grantChi(player, value - chi.Value)
+		elseif value < chi.Value then
+			spendChi(player, chi.Value - value)
+		end
+		print(string.format("[DEBUG_setChi] %s Chi = %d", player.Name, chi.Value))
 	end
-	-- Backdate from the current stored time (or now, if they've never claimed) so repeated calls
-	-- stack. A never-claimed player is already claimable, so this mainly matters post-claim.
-	local base = lastDailyClaim[player]
-	if base == nil or base == 0 then
-		base = os.time()
+
+	-- Set Spirit Power to an exact value. Set DIRECTLY (bypasses the Ascend multiplier on
+	-- purpose so you get exactly what you asked for), but still clamped to the Soul Jar cap.
+	_G.DEBUG_setSpiritPower = function(nameOrPlayer, value)
+		local player = resolvePlayer(nameOrPlayer)
+		if not player then return end
+		local leaderstats = player:FindFirstChild("leaderstats")
+		local sp = leaderstats and leaderstats:FindFirstChild("Spirit Power")
+		if not sp then
+			warn("[DEBUG_setSpiritPower] " .. player.Name .. " has no Spirit Power yet (data still loading?).")
+			return
+		end
+		value = math.max(0, math.floor(tonumber(value) or 0))
+		local cap = getSpiritCap(player)
+		sp.Value = math.min(value, cap)
+		markDirty(player)
+		print(string.format("[DEBUG_setSpiritPower] %s Spirit Power = %d (jar cap %d)", player.Name, sp.Value, cap))
 	end
-	lastDailyClaim[player] = base - math.floor(hours * 3600)
-	print(string.format(
-		"[DEBUG_dailyAdvance] %s: simulated %s hours passing (streak day = %d, next claim now available = %s).",
-		player.Name, tostring(hours), dailyStreak[player] or 0, tostring((select(1, dailyClaimStatus(player))))
-	))
+
+	-- Set Ascension count directly. Clamped to >= 0. NOTE: unlike a real Ascend this does NOT
+	-- reset Zen/Chi/Spirit Power — it only sets the count (that's what you want for testing the
+	-- multiplier / Zen cap / world requirements). Refreshes the stats panel + world unlocks.
+	_G.DEBUG_setAscends = function(nameOrPlayer, count)
+		local player = resolvePlayer(nameOrPlayer)
+		if not player then return end
+		count = math.max(0, math.floor(tonumber(count) or 0))
+		ascendCount[player] = count
+		markDirty(player)
+		pushStats(player) -- Ascend multiplier changed
+		checkWorldUnlocks(player) -- Ascend threshold may now unlock worlds
+		print(string.format("[DEBUG_setAscends] %s AscendCount = %d (mult x%.3f)", player.Name, count, getAscendMultiplier(player)))
+	end
+
+	-- Set Soul Jar tier directly (0 = Clay .. #tiers-1). Clamped to a valid tier. Re-clamps
+	-- Spirit Power to the new cap if you lowered the tier below the current holdings.
+	_G.DEBUG_setJarTier = function(nameOrPlayer, tier)
+		local player = resolvePlayer(nameOrPlayer)
+		if not player then return end
+		tier = math.max(0, math.min(#SOUL_JAR_TIERS - 1, math.floor(tonumber(tier) or 0)))
+		jarTier[player] = tier
+		local leaderstats = player:FindFirstChild("leaderstats")
+		local sp = leaderstats and leaderstats:FindFirstChild("Spirit Power")
+		if sp then
+			sp.Value = math.min(sp.Value, getSpiritCap(player)) -- lowering tier can shrink the cap
+		end
+		markDirty(player)
+		print(string.format("[DEBUG_setJarTier] %s JarTier = %d (%s, cap %d)", player.Name, tier, SOUL_JAR_TIERS[tier + 1].name, getSpiritCap(player)))
+	end
+
+	-- Set Zen level directly. Clamped to [0, current Zen cap] (the cap rises with Ascends).
+	_G.DEBUG_setZen = function(nameOrPlayer, level)
+		local player = resolvePlayer(nameOrPlayer)
+		if not player then return end
+		level = math.max(0, math.min(getZenCap(player), math.floor(tonumber(level) or 0)))
+		zenLevel[player] = level
+		markDirty(player)
+		print(string.format("[DEBUG_setZen] %s ZenLevel = %d (x%d click)", player.Name, level, getZenMultiplier(level)))
+	end
+
+	-- Unlock a single world for a player (permanent). Pushes the unlock event so an open
+	-- Worlds menu refreshes + toasts, exactly like a real unlock.
+	_G.DEBUG_unlockWorld = function(nameOrPlayer, index)
+		local player = resolvePlayer(nameOrPlayer)
+		if not player then return end
+		index = tonumber(index)
+		if WORLDS[index] == nil then
+			warn("[DEBUG_unlockWorld] No world #" .. tostring(index) .. ". Valid: 1.." .. tostring(#WORLDS))
+			return
+		end
+		local set = unlockedWorlds[player] or { [DEFAULT_WORLD] = true }
+		unlockedWorlds[player] = set
+		set[index] = true
+		markDirty(player)
+		worldUnlockedEvent:FireClient(player, index, WORLDS[index].name)
+		print(string.format("[DEBUG_unlockWorld] %s unlocked world %d (%s)", player.Name, index, WORLDS[index].name))
+	end
+
+	-- Unlock ALL configured worlds for a player at once.
+	_G.DEBUG_unlockAllWorlds = function(nameOrPlayer)
+		local player = resolvePlayer(nameOrPlayer)
+		if not player then return end
+		local set = unlockedWorlds[player] or { [DEFAULT_WORLD] = true }
+		unlockedWorlds[player] = set
+		for index in pairs(WORLDS) do
+			if not set[index] then
+				set[index] = true
+				worldUnlockedEvent:FireClient(player, index, WORLDS[index].name)
+			end
+		end
+		markDirty(player)
+		print(string.format("[DEBUG_unlockAllWorlds] %s now owns all %d worlds", player.Name, #WORLDS))
+	end
+
+	-- Move a player into a world (and unlock it), to verify per-world altar/click rates.
+	_G.DEBUG_setWorld = function(nameOrPlayer, index)
+		local player = resolvePlayer(nameOrPlayer)
+		if not player then return end
+		index = tonumber(index)
+		if WORLDS[index] == nil then
+			warn("[DEBUG_setWorld] No world #" .. tostring(index) .. ". Valid: 1.." .. tostring(#WORLDS))
+			return
+		end
+		currentWorld[player] = index
+		local set = unlockedWorlds[player] or { [DEFAULT_WORLD] = true }
+		unlockedWorlds[player] = set
+		set[index] = true -- unlock it too, so state stays consistent
+		atHub[player] = false -- actually stand in the world (not the hub) so rates apply
+		markDirty(player)
+		syncWorldAttributes(player)
+		pushStats(player)
+		if player.Character then
+			placeCharacter(player, player.Character) -- teleport to the world now
+		end
+		print(string.format("[DEBUG_setWorld] %s -> world %d (%s), conversionRate = %s", player.Name, index, WORLDS[index].name, tostring(WORLDS[index].conversionRate)))
+	end
+
+	-- Fast-test the daily-reward TIME logic without waiting: BACKDATES the last-claim timestamp
+	-- by `hours` (default 24). All claim logic uses os.time() deltas, so this is indistinguishable
+	-- from real elapsed time. 24h → next claim available; 50h → simulate a >48h "miss".
+	_G.DEBUG_dailyAdvance = function(nameOrPlayer, hours)
+		local player = resolvePlayer(nameOrPlayer)
+		if not player then return end
+		hours = tonumber(hours) or 24
+		local base = lastDailyClaim[player]
+		if base == nil or base == 0 then
+			base = os.time() -- never-claimed players are already claimable; backdate from now
+		end
+		lastDailyClaim[player] = base - math.floor(hours * 3600)
+		markDirty(player)
+		print(string.format("[DEBUG_dailyAdvance] %s: simulated %s hours (streak day %d, claimable now = %s)", player.Name, tostring(hours), dailyStreak[player] or 0, tostring((select(1, dailyClaimStatus(player))))))
+	end
+
+	-- Force an immediate save (respects canSave). Handy to confirm a change persisted before
+	-- you stop the playtest.
+	_G.DEBUG_save = function(nameOrPlayer)
+		local player = resolvePlayer(nameOrPlayer)
+		if not player then return end
+		savePlayerData(player, true)
+		print("[DEBUG_save] forced save requested for " .. player.Name)
+	end
+
+	-- Print a player's full current progression state to the output.
+	_G.DEBUG_dump = function(nameOrPlayer)
+		local player = resolvePlayer(nameOrPlayer)
+		if not player then return end
+		local leaderstats = player:FindFirstChild("leaderstats")
+		local sp = leaderstats and leaderstats:FindFirstChild("Spirit Power")
+		local chi = player:FindFirstChild("Chi")
+		local unlocked = {}
+		for idx in pairs(unlockedWorlds[player] or {}) do
+			table.insert(unlocked, idx)
+		end
+		table.sort(unlocked)
+		print(string.format(
+			"[DEBUG_dump] %s | Chi=%d  SpiritPower=%d/%d  Ascends=%d  JarTier=%d(%s)  Zen=%d  World=%d atHub=%s  Unlocked={%s}  DailyStreak=%d canSave=%s",
+			player.Name,
+			chi and chi.Value or -1,
+			sp and sp.Value or -1, getSpiritCap(player),
+			ascendCount[player] or 0,
+			jarTier[player] or 0, SOUL_JAR_TIERS[(jarTier[player] or 0) + 1].name,
+			zenLevel[player] or 0,
+			currentWorld[player] or DEFAULT_WORLD, tostring(atHub[player]),
+			table.concat(unlocked, ","),
+			dailyStreak[player] or 0,
+			tostring(canSave[player])
+		))
+	end
+
+	-- List every available debug command.
+	_G.DEBUG_help = function()
+		print([[
+[DEBUG] Studio-only testing commands (run command bar in SERVER context, call by username):
+  _G.DEBUG_setChi("name", 5000)
+  _G.DEBUG_setSpiritPower("name", 1000)
+  _G.DEBUG_setAscends("name", 3)
+  _G.DEBUG_setJarTier("name", 4)          -- 0=Clay .. up to top tier
+  _G.DEBUG_setZen("name", 5)
+  _G.DEBUG_unlockWorld("name", 2)
+  _G.DEBUG_unlockAllWorlds("name")
+  _G.DEBUG_setWorld("name", 2)            -- move into + unlock a world
+  _G.DEBUG_dailyAdvance("name", 24)       -- backdate daily-claim timer by N hours
+  _G.DEBUG_save("name")                   -- force an immediate save
+  _G.DEBUG_dump("name")                   -- print full state
+]])
+	end
+
+	print("[DEBUG] Studio testing commands registered. Run _G.DEBUG_help() in the SERVER command bar.")
 end
 
 --------------------------------------------------------------------------------
